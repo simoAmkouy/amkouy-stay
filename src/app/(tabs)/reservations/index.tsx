@@ -1,5 +1,5 @@
 import { router } from 'expo-router';
-import { useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { Pressable, StyleSheet, Text, View } from 'react-native';
 
 import { AccessGuard } from '@/components/amkouy/access-guard';
@@ -18,12 +18,31 @@ import { SortOption } from '@/components/amkouy/sort-selector';
 import { StatusFilter } from '@/components/amkouy/status-filter';
 import { ReservationForm } from '@/components/forms/reservation-form';
 import { Icon } from '@/components/icon';
+import { BulkActionBar } from '@/components/reservations/BulkActionBar';
+import { BulkStatusModal } from '@/components/reservations/BulkStatusModal';
+import { ReservationSelectionCheckbox } from '@/components/reservations/ReservationSelectionCheckbox';
+import { SelectAllRow, SelectionToggle } from '@/components/reservations/SelectionToolbar';
 import { AmkouyColors } from '@/constants/amkouy-theme';
 import { robotoText } from '@/constants/typography';
-import { useCreateReservation, useReservations } from '@/hooks/use-reservations';
-import { DoubleBookingError, ReservationStatus } from '@/lib/queries/reservations';
-import { RESERVATION_STATUS_OPTIONS, ReservationFormValues } from '@/lib/validation/reservation';
-import { notify } from '@/utils/alert';
+import { useAuth } from '@/hooks/use-auth';
+import {
+  useCreateReservation,
+  useDeleteReservation,
+  useReservations,
+  useUpdateReservation,
+} from '@/hooks/use-reservations';
+import {
+  DoubleBookingError,
+  ReservationFormInput,
+  ReservationStatus,
+  ReservationWithRelations,
+} from '@/lib/queries/reservations';
+import {
+  RESERVATION_STATUS_OPTIONS,
+  ReservationFormValues,
+  ReservationStatusValue,
+} from '@/lib/validation/reservation';
+import { confirmDestructive, notify } from '@/utils/alert';
 import { computeRangeForFilter, toDateOnlyString } from '@/utils/date-range';
 import { getErrorMessage, logAppError } from '@/utils/errors';
 import { formatMAD, getInitials } from '@/utils/format';
@@ -85,6 +104,27 @@ function compareStrings(a: string, b: string) {
   return a.localeCompare(b);
 }
 
+/** Builds the exact `ReservationFormInput` shape `updateReservation` expects, from an already-
+ * loaded row plus a new status — so the bulk status change goes through the very same query-layer
+ * function (and its transition/booking guards) as the single-reservation edit form, never a
+ * parallel "just patch the status column" shortcut. */
+function toReservationInput(r: ReservationWithRelations, status: ReservationStatus): ReservationFormInput {
+  return {
+    propertyId: r.property_id,
+    channelId: r.channel_id,
+    guestName: r.guest?.full_name ?? '',
+    guestPhone: r.guest?.phone ?? '',
+    checkInDate: r.check_in_date,
+    checkOutDate: r.check_out_date,
+    nightlyRate: r.nightly_rate,
+    cleaningFeeAmount: r.cleaning_fee_amount,
+    adults: r.adults,
+    children: r.children,
+    status,
+    specialRequests: r.special_requests ?? undefined,
+  };
+}
+
 export default function ReservationsScreen() {
   const [query, setQuery] = useState('');
   const [statuses, setStatuses] = useState<ReservationStatus[]>([]);
@@ -97,6 +137,30 @@ export default function ReservationsScreen() {
   const [customError, setCustomError] = useState<string | null>(null);
   const [showCreate, setShowCreate] = useState(false);
 
+  // Bulk selection — off by default; every piece of state below only ever affects rendering while
+  // `selectionMode` is true, so the page is untouched when it's off.
+  const [selectionMode, setSelectionMode] = useState(false);
+  const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
+  const [bulkStatusVisible, setBulkStatusVisible] = useState(false);
+  const [bulkStatusValue, setBulkStatusValue] = useState<ReservationStatusValue | ''>('');
+  const [bulkStatusSubmitting, setBulkStatusSubmitting] = useState(false);
+  const [bulkDeleting, setBulkDeleting] = useState(false);
+
+  const { profile } = useAuth();
+  const isAdmin = profile?.role === 'admin' || profile?.role === 'super_admin';
+
+  // Bulk status/delete loops await one mutation at a time and can run for a while against 500+
+  // selected rows — this guards their post-loop state updates/alerts so navigating away
+  // mid-operation doesn't pop a notification over whatever screen the user is on next. The
+  // mutations themselves (and their cache invalidation) are unaffected and still run to completion.
+  const isMountedRef = useRef(true);
+  useEffect(() => {
+    isMountedRef.current = true;
+    return () => {
+      isMountedRef.current = false;
+    };
+  }, []);
+
   const dateRange = useMemo(() => {
     if (dateFilter === 'all') return undefined;
     if (dateFilter === 'custom') return customRange ?? undefined;
@@ -106,6 +170,8 @@ export default function ReservationsScreen() {
 
   const { data: reservations, isLoading, isError, refetch } = useReservations({ statuses, dateRange });
   const createReservation = useCreateReservation();
+  const updateReservationMutation = useUpdateReservation();
+  const deleteReservationMutation = useDeleteReservation();
 
   const filtered = useMemo(() => {
     const list = (reservations ?? []).filter((r) => {
@@ -159,6 +225,19 @@ export default function ReservationsScreen() {
     });
     return sorted;
   }, [reservations, query, sortBy]);
+
+  // "Only visible reservations should be selected" — derived rather than synced back into
+  // `selectedIds` via an effect, so a filter/search/sort change that drops a previously-selected
+  // reservation out of `filtered` simply stops counting/acting on it, with no extra render pass.
+  const visibleSelectedIds = useMemo(() => {
+    if (selectedIds.size === 0) return selectedIds;
+    const visible = new Set(filtered.map((r) => r.id));
+    const next = new Set<string>();
+    selectedIds.forEach((id) => {
+      if (visible.has(id)) next.add(id);
+    });
+    return next;
+  }, [selectedIds, filtered]);
 
   const handleDateFilterChange = (value: DateFilterValue) => {
     if (value === 'custom') {
@@ -218,9 +297,139 @@ export default function ReservationsScreen() {
     );
   };
 
+  const toggleSelectionMode = () => {
+    setSelectionMode((prev) => !prev);
+    setSelectedIds(new Set());
+  };
+
+  const toggleSelected = (id: string) => {
+    setSelectedIds((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  };
+
+  const allVisibleSelected = filtered.length > 0 && filtered.every((r) => visibleSelectedIds.has(r.id));
+
+  const toggleSelectAll = () => {
+    setSelectedIds(allVisibleSelected ? new Set() : new Set(filtered.map((r) => r.id)));
+  };
+
+  const openStatusModal = () => {
+    setBulkStatusValue('');
+    setBulkStatusVisible(true);
+  };
+
+  const closeStatusModal = () => {
+    setBulkStatusVisible(false);
+    setBulkStatusValue('');
+  };
+
+  // Bulk status change — reuses `useUpdateReservation` / `reservationsApi.updateReservation` one
+  // reservation at a time, so the exact same transition-validation, double-booking guard, activity
+  // logging and staff notifications as the existing edit form apply to every selected row, with no
+  // bypass. Rows that fail (e.g. an invalid transition for that particular row) are simply left
+  // unchanged and counted as a failure.
+  const handleBulkStatusSubmit = async () => {
+    if (!bulkStatusValue) return;
+    const targets = filtered.filter((r) => visibleSelectedIds.has(r.id));
+    if (targets.length === 0) {
+      closeStatusModal();
+      return;
+    }
+    setBulkStatusSubmitting(true);
+    let success = 0;
+    let failed = 0;
+    for (const target of targets) {
+      try {
+        await updateReservationMutation.mutateAsync({
+          id: target.id,
+          input: toReservationInput(target, bulkStatusValue),
+        });
+        success += 1;
+      } catch (error) {
+        failed += 1;
+        logAppError('reservations/index bulkStatusUpdate', error);
+      }
+    }
+    if (!isMountedRef.current) return;
+    setBulkStatusSubmitting(false);
+    closeStatusModal();
+    setSelectedIds(new Set());
+    if (failed === 0) {
+      notify('Statut mis à jour', `${success} réservation(s) mise(s) à jour.`);
+    } else {
+      notify(
+        'Mise à jour partielle',
+        `${success} réussie(s), ${failed} échouée(s) (transition invalide ou bien indisponible).`
+      );
+    }
+  };
+
+  // Bulk delete — reuses `useDeleteReservation` / `softDeleteReservation` per row, so a reservation
+  // that's checked-in or has collected payments still throws `ReservationNotDeletableError` exactly
+  // as today; that row is simply left undeleted and counted as a failure, never forced through.
+  const handleBulkDelete = () => {
+    const targets = Array.from(visibleSelectedIds);
+    if (targets.length === 0) return;
+    confirmDestructive(
+      'Supprimer les réservations sélectionnées ?',
+      `${targets.length} réservation(s) seront retirée(s) de vos listes.`,
+      () => {
+        setBulkDeleting(true);
+        (async () => {
+          let success = 0;
+          let failed = 0;
+          let firstFailureMessage: string | null = null;
+          for (const id of targets) {
+            try {
+              await deleteReservationMutation.mutateAsync(id);
+              success += 1;
+            } catch (error) {
+              failed += 1;
+              if (!firstFailureMessage) firstFailureMessage = getErrorMessage(error, 'Suppression impossible.');
+              logAppError('reservations/index bulkDelete', error);
+            }
+          }
+          if (!isMountedRef.current) return;
+          setBulkDeleting(false);
+          setSelectedIds(new Set());
+          if (failed === 0) {
+            notify('Réservations supprimées', `${success} réservation(s) supprimée(s).`);
+          } else {
+            notify(
+              'Suppression partielle',
+              `${success} supprimée(s), ${failed} non supprimée(s) : ${firstFailureMessage}`
+            );
+          }
+        })();
+      }
+    );
+  };
+
+  const handleExportPlaceholder = () => {
+    notify('Exporter', 'Fonctionnalité à venir.');
+  };
+
   return (
     <AccessGuard resource="reservations">
-    <Screen contentPadding={false}>
+    <Screen
+      contentPadding={false}
+      footer={
+        selectionMode && visibleSelectedIds.size > 0 ? (
+          <BulkActionBar
+            count={visibleSelectedIds.size}
+            canDelete={isAdmin}
+            deleting={bulkDeleting}
+            onChangeStatus={openStatusModal}
+            onDelete={handleBulkDelete}
+            onExport={handleExportPlaceholder}
+            onCancel={() => setSelectedIds(new Set())}
+          />
+        ) : undefined
+      }>
       <View style={styles.header}>
         <View>
           <Text style={styles.title}>Réservations</Text>
@@ -233,15 +442,20 @@ export default function ReservationsScreen() {
         </Pressable>
       </View>
 
-      <ListFilterBar
-        searchValue={query}
-        onSearchChange={setQuery}
-        searchPlaceholder="Client, bien…"
-        sortOptions={SORT_OPTIONS}
-        sortValue={sortBy}
-        onSortChange={setSortBy}
-        onRefresh={refetch}
-      />
+      <View style={styles.filterBarRow}>
+        <View style={{ flex: 1 }}>
+          <ListFilterBar
+            searchValue={query}
+            onSearchChange={setQuery}
+            searchPlaceholder="Client, bien…"
+            sortOptions={SORT_OPTIONS}
+            sortValue={sortBy}
+            onSortChange={setSortBy}
+            onRefresh={refetch}
+          />
+        </View>
+        <SelectionToggle active={selectionMode} onToggle={toggleSelectionMode} />
+      </View>
 
       <View style={styles.filterRow}>
         <StatusFilter
@@ -260,6 +474,15 @@ export default function ReservationsScreen() {
         />
       </View>
 
+      {selectionMode && (
+        <SelectAllRow
+          visibleCount={filtered.length}
+          selectedCount={visibleSelectedIds.size}
+          allSelected={allVisibleSelected}
+          onToggleAll={toggleSelectAll}
+        />
+      )}
+
       {isLoading && <LoadingState label="Chargement des réservations…" />}
       {isError && <ErrorState message="Impossible de charger les réservations." onRetry={refetch} />}
       {!isLoading && !isError && filtered.length === 0 && (
@@ -270,10 +493,16 @@ export default function ReservationsScreen() {
         <View style={styles.list}>
           {filtered.map((res) => {
             const statusColors = STATUS_COLOR[res.status];
+            const isSelected = visibleSelectedIds.has(res.id);
             return (
-              <Pressable key={res.id} onPress={() => router.push(`/reservations/${res.id}`)}>
+              <Pressable
+                key={res.id}
+                onPress={() => (selectionMode ? toggleSelected(res.id) : router.push(`/reservations/${res.id}`))}>
                 <Card style={styles.card}>
                   <View style={styles.topRow}>
+                    {selectionMode && (
+                      <ReservationSelectionCheckbox selected={isSelected} onToggle={() => toggleSelected(res.id)} />
+                    )}
                     <Avatar initials={getInitials(res.guest?.full_name ?? '?')} />
                     <View style={{ flex: 1 }}>
                       <Text style={styles.guest}>{res.guest?.full_name ?? 'Client inconnu'}</Text>
@@ -310,6 +539,16 @@ export default function ReservationsScreen() {
         onClose={() => setShowCreate(false)}
         onSubmit={handleCreate}
         submitting={createReservation.isPending}
+      />
+
+      <BulkStatusModal
+        visible={bulkStatusVisible}
+        targetCount={visibleSelectedIds.size}
+        value={bulkStatusValue}
+        onChangeValue={setBulkStatusValue}
+        onClose={closeStatusModal}
+        onSubmit={handleBulkStatusSubmit}
+        submitting={bulkStatusSubmitting}
       />
 
       <FormModal
@@ -360,6 +599,11 @@ const styles = StyleSheet.create({
     backgroundColor: AmkouyColors.primary,
     alignItems: 'center',
     justifyContent: 'center',
+  },
+  filterBarRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    paddingRight: 22,
   },
   filterRow: {
     paddingTop: 10,
