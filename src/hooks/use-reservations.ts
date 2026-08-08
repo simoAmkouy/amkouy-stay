@@ -65,7 +65,16 @@ export function useUpdateReservation() {
 export function useDeleteReservation() {
   const queryClient = useQueryClient();
   return useMutation({
-    mutationFn: (id: string) => reservationsApi.softDeleteReservation(id),
+    mutationFn: ({ id, reason }: { id: string; reason?: string }) =>
+      reservationsApi.softDeleteReservation(id, reason),
+    onSuccess: () => queryClient.invalidateQueries({ queryKey: KEY }),
+  });
+}
+
+export function useBulkDeleteReservations() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: (ids: string[]) => reservationsApi.bulkDeleteReservations(ids),
     onSuccess: () => queryClient.invalidateQueries({ queryKey: KEY }),
   });
 }

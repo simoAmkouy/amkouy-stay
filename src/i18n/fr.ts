@@ -46,6 +46,7 @@ const fr = {
     operations: 'Opérations',
     properties: 'Biens',
     reservations: 'Réserv.',
+    calendar: 'Calendrier',
     more: 'Plus',
     portal: 'Portail',
     tasks: 'Mes tâches',

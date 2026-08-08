@@ -181,7 +181,7 @@ export function computePaymentStatus(
   checkInDate: string,
   today: Date = new Date()
 ): PaymentStatus {
-  const todayStr = today.toISOString().slice(0, 10);
+  const todayStr = `${today.getFullYear()}-${String(today.getMonth() + 1).padStart(2, '0')}-${String(today.getDate()).padStart(2, '0')}`;
   if (summary.netCollected <= 0 && summary.refunded > 0) return 'refunded';
   if (summary.outstanding <= 0 && summary.netCollected > 0) return 'paid';
   if (summary.outstanding > 0 && checkInDate < todayStr) return 'overdue';

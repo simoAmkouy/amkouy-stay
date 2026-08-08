@@ -30,7 +30,8 @@ export function ListFilterBar<T extends string>({
   onRefresh?: () => void;
 }) {
   return (
-    <View style={styles.row}>
+    <View
+      style={styles.row}>
       <SearchBar
         value={searchValue}
         onChangeText={onSearchChange}

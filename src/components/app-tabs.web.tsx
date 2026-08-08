@@ -30,6 +30,7 @@ const ALL_TAB_KEYS: TabKey[] = [
   'operations',
   'properties',
   'reservations',
+  'calendar',
   'portal',
   'tasks',
   'tickets',
@@ -95,7 +96,7 @@ function CustomTabList(props: TabListProps) {
   const { t } = useTranslation();
   const { isRTL } = useLocale();
   return (
-    <View {...props} style={styles.tabListContainer}>
+    <View {...props} style={[styles.tabListContainer, { pointerEvents: 'box-none' }]}>
       <View style={[styles.innerContainer, isRTL && styles.innerContainerRTL]}>
         <Text style={[styles.brandText, isRTL && styles.brandTextRTL]} numberOfLines={1}>
           {t('login.brand')}

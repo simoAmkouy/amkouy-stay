@@ -3,6 +3,7 @@ import { useState } from 'react';
 import { Pressable, StyleSheet, Text, View } from 'react-native';
 
 import { AccessGuard } from '@/components/amkouy/access-guard';
+import { FormModal } from '@/components/amkouy/form-modal';
 import { Avatar } from '@/components/amkouy/avatar';
 import { Badge } from '@/components/amkouy/badge';
 import { Card } from '@/components/amkouy/card';
@@ -12,6 +13,7 @@ import { HeroHeader } from '@/components/amkouy/hero-header';
 import { IconActionButton } from '@/components/amkouy/icon-action-button';
 import { LoadingState } from '@/components/amkouy/loading-state';
 import { Screen } from '@/components/amkouy/screen';
+import { SelectField } from '@/components/amkouy/select-field';
 import { Timeline } from '@/components/amkouy/timeline';
 import { AssignServiceProviderForm } from '@/components/forms/assign-service-provider-form';
 import { PaymentForm } from '@/components/forms/payment-form';
@@ -60,6 +62,15 @@ import { getErrorMessage } from '@/utils/errors';
 import { formatMAD, getInitials } from '@/utils/format';
 import { goBackOrReplace } from '@/utils/navigation';
 
+const DELETE_REASON_OPTIONS = [
+  { label: 'Aucune raison spécifiée', value: '' },
+  { label: 'Réservation dupliquée', value: 'duplicate' },
+  { label: 'Annulation client', value: 'client_cancelled' },
+  { label: 'Réservation test', value: 'test' },
+  { label: 'Créée par erreur', value: 'created_by_mistake' },
+  { label: 'Autre', value: 'other' },
+];
+
 const STATUS_LABEL = Object.fromEntries(RESERVATION_STATUS_OPTIONS.map((o) => [o.value, o.label]));
 const STATUS_COLOR: Record<string, { bg: string; text: string }> = {
   pending: { bg: '#FDEBC8', text: '#B45309' },
@@ -85,6 +96,14 @@ const SERVICE_STATUS_COLOR: Record<string, { bg: string; text: string }> = {
 const ACTIVITY_LABELS: Record<string, string> = {
   'reservation.created': 'Réservation créée',
   'reservation.updated': 'Réservation modifiée',
+  'reservation.status_changed': 'Statut modifié',
+  'reservation.price_changed': 'Prix modifié',
+  'reservation.dates_changed': 'Dates modifiées',
+  'reservation.guest_changed': 'Client modifié',
+  'reservation.property_changed': 'Bien modifié',
+  'reservation.channel_changed': 'Canal modifié',
+  'reservation.deleted': 'Réservation supprimée',
+  'reservation.bulk_deleted': 'Suppression groupée',
   'reservation_service.added': 'Service ajouté',
   'reservation_service.updated': 'Service modifié',
   'reservation_service.removed': 'Service supprimé',
@@ -109,6 +128,14 @@ const ACTIVITY_COLOR: Record<string, { dot: string; ring: string }> = {
   'reservation_service.removed': { dot: '#D1D5DB', ring: '#eceef1' },
   'reservation_service.cancelled': { dot: '#EF4444', ring: '#fbd5d5' },
   'reservation_service.refunded': { dot: '#D1D5DB', ring: '#eceef1' },
+  'reservation.status_changed': { dot: '#C9A84C', ring: '#f0e2b8' },
+  'reservation.price_changed': { dot: '#C9A84C', ring: '#f0e2b8' },
+  'reservation.dates_changed': { dot: '#6D4FC9', ring: '#e3dcf7' },
+  'reservation.guest_changed': { dot: '#6D4FC9', ring: '#e3dcf7' },
+  'reservation.property_changed': { dot: '#B45309', ring: '#fbe4c0' },
+  'reservation.channel_changed': { dot: '#B45309', ring: '#fbe4c0' },
+  'reservation.deleted': { dot: '#EF4444', ring: '#fbd5d5' },
+  'reservation.bulk_deleted': { dot: '#EF4444', ring: '#fbd5d5' },
 };
 
 function describeActivity(row: ActivityLogRow): string {
@@ -161,6 +188,8 @@ function ReservationDetailContent() {
   const refundPayment = useRefundPayment();
 
   const [showEdit, setShowEdit] = useState(false);
+  const [showDeleteReason, setShowDeleteReason] = useState(false);
+  const [deleteReason, setDeleteReason] = useState('');
   const [showPaymentForm, setShowPaymentForm] = useState(false);
   const [showRefundForm, setShowRefundForm] = useState(false);
   const [showServiceForm, setShowServiceForm] = useState(false);
@@ -206,12 +235,26 @@ function ReservationDetailContent() {
 
   const handleDelete = () => {
     if (!reservation) return;
-    confirmDestructive('Supprimer cette réservation ?', 'Cette action retirera la réservation de vos listes.', () => {
-      deleteReservation.mutate(reservation.id, {
-        onSuccess: () => goBackOrReplace('/reservations'),
-        onError: (error) => notify('Erreur', getErrorMessage(error, 'Suppression impossible.')),
-      });
-    });
+    setDeleteReason('');
+    setShowDeleteReason(true);
+  };
+
+  const handleDeleteConfirm = () => {
+    if (!reservation) return;
+    setShowDeleteReason(false);
+    confirmDestructive(
+      'Supprimer cette réservation ?',
+      'Cette action retirera la réservation de vos listes.',
+      () => {
+        deleteReservation.mutate(
+          { id: reservation.id, reason: deleteReason || undefined },
+          {
+            onSuccess: () => goBackOrReplace('/reservations'),
+            onError: (error) => notify('Erreur', getErrorMessage(error, 'Suppression impossible.')),
+          }
+        );
+      }
+    );
   };
 
   const handleAddService = () => {
@@ -661,6 +704,22 @@ function ReservationDetailContent() {
         onSubmit={handleRefund}
         submitting={refundPayment.isPending}
       />
+
+      <FormModal
+        visible={showDeleteReason}
+        title="Supprimer la réservation"
+        onClose={() => setShowDeleteReason(false)}
+        onSubmit={handleDeleteConfirm}
+        submitting={false}
+        submitLabel="Continuer">
+        <SelectField
+          label="Raison de suppression (optionnel)"
+          value={deleteReason}
+          options={DELETE_REASON_OPTIONS}
+          onChange={setDeleteReason}
+          placeholder="Aucune raison spécifiée"
+        />
+      </FormModal>
     </Screen>
   );
 }

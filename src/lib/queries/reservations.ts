@@ -1,3 +1,4 @@
+import { buildReservationSnapshot, computeChangedFields, generateBulkOperationId, logReservationAudit } from '@/lib/queries/reservation-audit';
 import { logActivity } from '@/lib/queries/activity-log';
 import { notifyUsers } from '@/lib/queries/notifications';
 import { getReservationPaymentSummary } from '@/lib/queries/payments';
@@ -45,7 +46,8 @@ export async function listReservations(filters: ReservationListFilters = {}): Pr
 /** Owner Portal's "upcoming reservations" — relies on the same `reservations_select` RLS
  * (owns_property()) as everything else on that screen, so an owner only ever sees their own. */
 export async function listUpcomingReservations(limit = 5): Promise<ReservationWithRelations[]> {
-  const today = new Date().toISOString().slice(0, 10);
+  const _d = new Date();
+  const today = `${_d.getFullYear()}-${String(_d.getMonth() + 1).padStart(2, '0')}-${String(_d.getDate()).padStart(2, '0')}`;
   const { data, error } = await supabase
     .from('reservations')
     .select(RESERVATION_SELECT)
@@ -62,7 +64,8 @@ export async function listUpcomingReservations(limit = 5): Promise<ReservationWi
  * (which orders by check_in_date and would miss a reservation whose guest already checked in but
  * hasn't checked out yet). Same RLS (`owns_property()`) scoping as every other owner-portal query. */
 export async function listUpcomingCheckouts(limit = 5): Promise<ReservationWithRelations[]> {
-  const today = new Date().toISOString().slice(0, 10);
+  const _d = new Date();
+  const today = `${_d.getFullYear()}-${String(_d.getMonth() + 1).padStart(2, '0')}-${String(_d.getDate()).padStart(2, '0')}`;
   const { data, error } = await supabase
     .from('reservations')
     .select(RESERVATION_SELECT)
@@ -236,7 +239,8 @@ async function assertPropertyOperationallyReady(propertyId: string): Promise<voi
     );
   }
 
-  const todayStr = new Date().toISOString().slice(0, 10);
+  const _td = new Date();
+  const todayStr = `${_td.getFullYear()}-${String(_td.getMonth() + 1).padStart(2, '0')}-${String(_td.getDate()).padStart(2, '0')}`;
   const { data: lastCheckouts, error: checkoutError } = await supabase
     .from('reservations')
     .select('id')
@@ -270,6 +274,22 @@ async function assertPropertyOperationallyReady(propertyId: string): Promise<voi
   }
 }
 
+/** Priority-ordered detection of the most specific audit action for an update.
+ * Compares the before-snapshot (pre-update row) to the post-update row. */
+function detectReservationUpdateAction(
+  before: ReservationRow,
+  after: ReservationRow
+): string {
+  if (before.status !== after.status) return 'reservation.status_changed';
+  if (before.property_id !== after.property_id) return 'reservation.property_changed';
+  if (before.guest_id !== after.guest_id) return 'reservation.guest_changed';
+  if (before.channel_id !== after.channel_id) return 'reservation.channel_changed';
+  if (before.check_in_date !== after.check_in_date || before.check_out_date !== after.check_out_date)
+    return 'reservation.dates_changed';
+  if (Math.abs(before.total_amount - after.total_amount) > 0.001) return 'reservation.price_changed';
+  return 'reservation.updated';
+}
+
 export async function createReservation(input: ReservationFormInput): Promise<ReservationRow> {
   await assertPropertyBookable(input.propertyId);
   await assertPropertyOperationallyReady(input.propertyId);
@@ -293,7 +313,6 @@ export async function createReservation(input: ReservationFormInput): Promise<Re
     special_requests: input.specialRequests || null,
   };
 
-  console.log('[reservations] createReservation payload:', payload);
   const { data, error } = await supabase.from('reservations').insert(payload).select().single();
   if (error) {
     logAppError('reservations.createReservation (insert)', error);
@@ -301,21 +320,40 @@ export async function createReservation(input: ReservationFormInput): Promise<Re
     throw error;
   }
 
-  await logActivity({
-    entityType: 'reservation',
-    entityId: data.id,
-    action: 'reservation.created',
-    changes: { guest: input.guestName, check_in: input.checkInDate, check_out: input.checkOutDate },
-  });
+  const { data: fullCreated } = await supabase
+    .from('reservations')
+    .select(RESERVATION_SELECT)
+    .eq('id', data.id)
+    .maybeSingle();
+  await Promise.all([
+    logActivity({
+      entityType: 'reservation',
+      entityId: data.id,
+      action: 'reservation.created',
+      changes: { code: data.reservation_code },
+    }),
+    logReservationAudit({
+      reservationId: data.id,
+      action: 'reservation.created',
+      snapshotBefore: null,
+      snapshotAfter: fullCreated
+        ? buildReservationSnapshot(fullCreated as unknown as ReservationWithRelations, {
+            netCollected: 0,
+            outstanding: data.total_amount,
+          })
+        : null,
+    }),
+  ]);
   return data;
 }
 
 export async function updateReservation(id: string, input: ReservationFormInput): Promise<ReservationRow> {
-  const { data: before } = await supabase
+  const { data: beforeData } = await supabase
     .from('reservations')
-    .select('status, property_id')
+    .select(RESERVATION_SELECT)
     .eq('id', id)
     .maybeSingle();
+  const before = beforeData as unknown as ReservationWithRelations | null;
 
   if (before && before.status !== input.status) {
     const allowedNextStatuses = RESERVATION_STATUS_TRANSITIONS[before.status as ReservationStatusValue] ?? [];
@@ -351,7 +389,6 @@ export async function updateReservation(id: string, input: ReservationFormInput)
     special_requests: input.specialRequests || null,
   };
 
-  console.log('[reservations] updateReservation payload:', payload);
   const { data, error } = await supabase.from('reservations').update(payload).eq('id', id).select().single();
   if (error) {
     logAppError('reservations.updateReservation (update)', error);
@@ -359,12 +396,46 @@ export async function updateReservation(id: string, input: ReservationFormInput)
     throw error;
   }
 
-  await logActivity({
-    entityType: 'reservation',
-    entityId: data.id,
-    action: 'reservation.updated',
-    changes: { status: input.status },
-  });
+  try {
+    const [paymentSummary, { data: fullAfterRaw }] = await Promise.all([
+      getReservationPaymentSummary(data.id),
+      supabase.from('reservations').select(RESERVATION_SELECT).eq('id', data.id).maybeSingle(),
+    ]);
+    const fullAfter = fullAfterRaw as unknown as ReservationWithRelations | null;
+    const auditAction = before ? detectReservationUpdateAction(before, data) : 'reservation.updated';
+    const snapshotBefore = before
+      ? buildReservationSnapshot(before, {
+          netCollected: paymentSummary.netCollected,
+          outstanding: paymentSummary.outstanding,
+        })
+      : null;
+    const snapshotAfter = fullAfter
+      ? buildReservationSnapshot(fullAfter, {
+          netCollected: paymentSummary.netCollected,
+          outstanding: paymentSummary.outstanding,
+        })
+      : null;
+    const changedFields = computeChangedFields(snapshotBefore, snapshotAfter);
+    await Promise.all([
+      logActivity({
+        entityType: 'reservation',
+        entityId: data.id,
+        action: auditAction,
+        changes: before
+          ? { from_status: before.status, to_status: data.status, code: data.reservation_code }
+          : { code: data.reservation_code },
+      }),
+      logReservationAudit({
+        reservationId: data.id,
+        action: auditAction,
+        snapshotBefore,
+        snapshotAfter,
+        changedFields,
+      }),
+    ]);
+  } catch (auditError) {
+    logAppError('reservations.updateReservation (audit)', auditError);
+  }
 
   if (before && before.status !== data.status && (data.status === 'checked_in' || data.status === 'checked_out')) {
     const staffIds = await listStaffUserIds();
@@ -394,12 +465,13 @@ export class ReservationNotDeletableError extends Error {
  * that has any collected payments — those must be cancelled (a status transition, which keeps
  * the record and its payment history intact) rather than removed from every list with a single
  * tap. */
-export async function softDeleteReservation(id: string) {
-  const { data: reservation, error: fetchError } = await supabase
+export async function softDeleteReservation(id: string, reason?: string) {
+  const { data: reservationRaw, error: fetchError } = await supabase
     .from('reservations')
-    .select('status')
+    .select(RESERVATION_SELECT)
     .eq('id', id)
     .maybeSingle();
+  const reservation = reservationRaw as unknown as ReservationWithRelations | null;
   if (fetchError) {
     logAppError('reservations.softDeleteReservation (fetch)', fetchError);
     throw fetchError;
@@ -417,12 +489,150 @@ export async function softDeleteReservation(id: string) {
     );
   }
 
+  const {
+    data: { user },
+  } = await supabase.auth.getUser();
+  const actorId = user?.id ?? null;
+  const now = new Date().toISOString();
+
   const { error } = await supabase
     .from('reservations')
-    .update({ deleted_at: new Date().toISOString() })
+    .update({ deleted_at: now, deleted_by: actorId })
     .eq('id', id);
   if (error) {
     logAppError('reservations.softDeleteReservation', error);
     throw error;
   }
+
+  const snapshotBefore = reservation
+    ? buildReservationSnapshot(reservation, {
+        netCollected: paymentSummary.netCollected,
+        outstanding: paymentSummary.outstanding,
+      })
+    : null;
+  await Promise.all([
+    logActivity({
+      entityType: 'reservation',
+      entityId: id,
+      action: 'reservation.deleted',
+      changes: {
+        code: reservation?.reservation_code ?? null,
+        reason: reason ?? null,
+      },
+    }),
+    logReservationAudit({
+      reservationId: id,
+      action: 'reservation.deleted',
+      snapshotBefore,
+      snapshotAfter: snapshotBefore
+        ? { ...snapshotBefore, deleted_at: now, deleted_by: actorId, is_deleted: true }
+        : null,
+      reason: reason ?? null,
+    }),
+  ]);
+}
+
+// ---------------------------------------------------------------------------
+// BULK DELETE POLICY
+//
+//   deleted   — no collected payments → soft-delete (deleted_at = now()).
+//               Status is irrelevant: if no money was ever collected the record
+//               carries no financial history and is safe to remove.
+//
+//   protected — any collected payment exists (netCollected > 0).
+//               The reservation's status is left exactly as-is: pending,
+//               confirmed, checked_in, checked_out, completed, cancelled,
+//               no_show — whatever it already is. Nothing is mutated.
+//               This covers collected payments, owner-payment periods (which
+//               are derived from the payments table), and any future accounting
+//               lock, because all of them require at least one payment row.
+//
+//   failed    — unexpected Supabase/network error; counted but never thrown.
+//
+// The function never throws. Every reservation is processed independently so
+// one protected or failed row never blocks the rest of the batch.
+// ---------------------------------------------------------------------------
+
+export type BulkDeleteResult = {
+  deleted: number;
+  protected: number;
+  failed: number;
+};
+
+export async function bulkDeleteReservations(ids: string[]): Promise<BulkDeleteResult> {
+  const result: BulkDeleteResult = { deleted: 0, protected: 0, failed: 0 };
+
+  const { data: { user } } = await supabase.auth.getUser();
+  const actorId = user?.id ?? null;
+  const now = new Date().toISOString();
+
+  const bulkOperationId = generateBulkOperationId();
+  for (const id of ids) {
+    try {
+      const { data: rowRaw, error: fetchError } = await supabase
+        .from('reservations')
+        .select(RESERVATION_SELECT)
+        .eq('id', id)
+        .is('deleted_at', null)
+        .maybeSingle();
+
+      if (fetchError) {
+        logAppError('reservations.bulkDeleteReservations (fetch)', fetchError);
+        result.failed += 1;
+        continue;
+      }
+
+      const row = rowRaw as unknown as ReservationWithRelations | null;
+      if (!row) {
+        // Already deleted or not found — idempotent success.
+        result.deleted += 1;
+        continue;
+      }
+
+      const paymentSummary = await getReservationPaymentSummary(id);
+
+      if (paymentSummary.netCollected > 0) {
+        // Financial history exists — protect regardless of current status.
+        result.protected += 1;
+        continue;
+      }
+
+      // No financial history → safe to soft-delete.
+      const { error: deleteError } = await supabase
+        .from('reservations')
+        .update({ deleted_at: now, deleted_by: actorId })
+        .eq('id', id);
+
+      if (deleteError) {
+        logAppError('reservations.bulkDeleteReservations (soft-delete)', deleteError);
+        result.failed += 1;
+      } else {
+        result.deleted += 1;
+        const snapshotBefore = buildReservationSnapshot(row, {
+          netCollected: paymentSummary.netCollected,
+          outstanding: paymentSummary.outstanding,
+        });
+        await Promise.all([
+          logActivity({
+            entityType: 'reservation',
+            entityId: id,
+            action: 'reservation.bulk_deleted',
+            changes: { bulk_operation_id: bulkOperationId, code: row.reservation_code },
+          }),
+          logReservationAudit({
+            reservationId: id,
+            action: 'reservation.bulk_deleted',
+            snapshotBefore,
+            snapshotAfter: { ...snapshotBefore, deleted_at: now, deleted_by: actorId, is_deleted: true },
+            bulkOperationId,
+          }),
+        ]);
+      }
+    } catch (error) {
+      logAppError('reservations.bulkDeleteReservations (unexpected)', error);
+      result.failed += 1;
+    }
+  }
+
+  return result;
 }

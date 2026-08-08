@@ -20,6 +20,7 @@ const ALL_TAB_KEYS: TabKey[] = [
   'operations',
   'properties',
   'reservations',
+  'calendar',
   'portal',
   'tasks',
   'tickets',

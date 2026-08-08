@@ -45,6 +45,7 @@ const ar: TranslationDict = {
     operations: 'العمليات',
     properties: 'العقارات',
     reservations: 'الحجوزات',
+    calendar: 'التقويم',
     more: 'المزيد',
     portal: 'البوابة',
     tasks: 'مهامي',

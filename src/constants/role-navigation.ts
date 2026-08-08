@@ -20,6 +20,7 @@ export type TabKey =
   | 'operations'
   | 'properties'
   | 'reservations'
+  | 'calendar'
   | 'portal'
   | 'tasks'
   | 'tickets'
@@ -41,6 +42,7 @@ export const TAB_DEFS: Record<TabKey, TabDef> = {
   operations: { key: 'operations', name: 'operations', href: '/operations', labelKey: 'nav.operations', icon: 'dashboard' },
   properties: { key: 'properties', name: 'properties', href: '/properties', labelKey: 'nav.properties', icon: 'apartment' },
   reservations: { key: 'reservations', name: 'reservations', href: '/reservations', labelKey: 'nav.reservations', icon: 'event' },
+  calendar: { key: 'calendar', name: 'calendar', href: '/calendar' as Href, labelKey: 'nav.calendar', icon: 'calendar_month' },
   portal: { key: 'portal', name: 'portal', href: '/portal', labelKey: 'nav.portal', icon: 'badge' },
   tasks: { key: 'tasks', name: 'tasks', href: '/tasks', labelKey: 'nav.tasks', icon: 'cleaning_services' },
   tickets: { key: 'tickets', name: 'tickets', href: '/tickets', labelKey: 'nav.tickets', icon: 'build' },
@@ -77,10 +79,10 @@ export const TAB_DEFS: Record<TabKey, TabDef> = {
  * KPI on the Commercial Dashboard (Module 10/11), not a separate screen, so it isn't a 4th tab.
  */
 const ROLE_PRIMARY_TABS: Record<UserRole, TabKey[]> = {
-  super_admin: ['dashboard', 'operations', 'properties', 'reservations'],
-  admin: ['dashboard', 'operations', 'properties', 'reservations'],
+  super_admin: ['dashboard', 'operations', 'properties', 'reservations', 'calendar'],
+  admin: ['dashboard', 'operations', 'properties', 'reservations', 'calendar'],
   // Manager: unchanged — "keep operational visibility" (Phase 3).
-  manager: ['dashboard', 'operations', 'properties', 'reservations'],
+  manager: ['dashboard', 'operations', 'properties', 'reservations', 'calendar'],
   // Accountant: unchanged tabs — Phase 3's "Payments/Contracts/Reports/Exports" focus is already
   // served by the existing Operations Center integration (Module 9 payments, Module 7 contracts)
   // and the More menu (narrowed below), not by new top-level screens duplicating that content.

@@ -26,8 +26,8 @@ import { AmkouyColors } from '@/constants/amkouy-theme';
 import { robotoText } from '@/constants/typography';
 import { useAuth } from '@/hooks/use-auth';
 import {
+  useBulkDeleteReservations,
   useCreateReservation,
-  useDeleteReservation,
   useReservations,
   useUpdateReservation,
 } from '@/hooks/use-reservations';
@@ -171,7 +171,7 @@ export default function ReservationsScreen() {
   const { data: reservations, isLoading, isError, refetch } = useReservations({ statuses, dateRange });
   const createReservation = useCreateReservation();
   const updateReservationMutation = useUpdateReservation();
-  const deleteReservationMutation = useDeleteReservation();
+  const bulkDeleteMutation = useBulkDeleteReservations();
 
   const filtered = useMemo(() => {
     const list = (reservations ?? []).filter((r) => {
@@ -368,43 +368,35 @@ export default function ReservationsScreen() {
     }
   };
 
-  // Bulk delete — reuses `useDeleteReservation` / `softDeleteReservation` per row, so a reservation
-  // that's checked-in or has collected payments still throws `ReservationNotDeletableError` exactly
-  // as today; that row is simply left undeleted and counted as a failure, never forced through.
+  // Bulk delete — routes every selected reservation through `bulkDeleteReservations`, which
+  // classifies each one individually (deleted / protected / failed) and never throws.
+  // The summary alert always appears regardless of per-row outcomes.
   const handleBulkDelete = () => {
     const targets = Array.from(visibleSelectedIds);
     if (targets.length === 0) return;
     confirmDestructive(
       'Supprimer les réservations sélectionnées ?',
-      `${targets.length} réservation(s) seront retirée(s) de vos listes.`,
+      `${targets.length} réservation(s) vont être traitées. Celles ayant des paiements enregistrés seront protégées et resteront intactes.`,
       () => {
         setBulkDeleting(true);
-        (async () => {
-          let success = 0;
-          let failed = 0;
-          let firstFailureMessage: string | null = null;
-          for (const id of targets) {
-            try {
-              await deleteReservationMutation.mutateAsync(id);
-              success += 1;
-            } catch (error) {
-              failed += 1;
-              if (!firstFailureMessage) firstFailureMessage = getErrorMessage(error, 'Suppression impossible.');
+        bulkDeleteMutation.mutate(targets, {
+          onSettled: (result, error) => {
+            if (!isMountedRef.current) return;
+            setBulkDeleting(false);
+            setSelectedIds(new Set());
+            setSelectionMode(false);
+            if (error || !result) {
               logAppError('reservations/index bulkDelete', error);
+              notify('Erreur', getErrorMessage(error, 'Impossible de traiter la suppression groupée.'));
+              return;
             }
-          }
-          if (!isMountedRef.current) return;
-          setBulkDeleting(false);
-          setSelectedIds(new Set());
-          if (failed === 0) {
-            notify('Réservations supprimées', `${success} réservation(s) supprimée(s).`);
-          } else {
-            notify(
-              'Suppression partielle',
-              `${success} supprimée(s), ${failed} non supprimée(s) : ${firstFailureMessage}`
-            );
-          }
-        })();
+            const lines: string[] = [];
+            lines.push(`Supprimées : ${result.deleted}`);
+            lines.push(`Protégées : ${result.protected}`);
+            if (result.failed > 0) lines.push(`Échecs : ${result.failed}`);
+            notify('Suppression terminée', lines.join('\n'));
+          },
+        });
       }
     );
   };
@@ -437,9 +429,14 @@ export default function ReservationsScreen() {
             {reservations ? `${filtered.length} au total` : 'Chargement…'}
           </Text>
         </View>
-        <Pressable onPress={() => setShowCreate(true)} style={styles.addButton}>
-          <Icon name="add" size={24} color="#fff" />
-        </Pressable>
+        <View style={styles.headerActions}>
+          <Pressable onPress={() => router.push('/reservations/audit')} style={styles.historyButton}>
+            <Icon name="history" size={22} color={AmkouyColors.primary} />
+          </Pressable>
+          <Pressable onPress={() => setShowCreate(true)} style={styles.addButton}>
+            <Icon name="add" size={24} color="#fff" />
+          </Pressable>
+        </View>
       </View>
 
       <View style={styles.filterBarRow}>
@@ -592,6 +589,19 @@ const styles = StyleSheet.create({
   subtitle: {
     ...robotoText(400, 13, { color: AmkouyColors.textFaint, marginTop: 3 }),
   },
+  headerActions: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 8,
+  },
+  historyButton: {
+    width: 44,
+    height: 44,
+    borderRadius: 22,
+    backgroundColor: AmkouyColors.secondaryContainer,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
   addButton: {
     width: 44,
     height: 44,
@@ -603,7 +613,7 @@ const styles = StyleSheet.create({
   filterBarRow: {
     flexDirection: 'row',
     alignItems: 'center',
-    paddingRight: 22,
+    paddingRight: 8,
   },
   filterRow: {
     paddingTop: 10,
