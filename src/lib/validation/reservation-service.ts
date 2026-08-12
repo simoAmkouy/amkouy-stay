@@ -22,6 +22,7 @@ export const reservationServiceFormSchema = z.object({
   quantity: z.number().int().min(1, 'Doit être au moins 1.').max(50, 'Doit être au plus 50.'),
   unitPrice: z.number().min(0, 'Le prix doit être positif.'),
   costAmount: z.number().min(0, 'Doit être positif.').nullable(),
+  amountPaid: z.number().min(0, 'Le montant payé doit être positif.'),
   status: z.enum(SERVICE_STATUS_OPTIONS.map((o) => o.value) as [ReservationServiceStatus, ...ReservationServiceStatus[]]),
   scheduledDate: z.union([isoDate, z.literal('')]).optional(),
   scheduledTime: z.string().trim().optional(),

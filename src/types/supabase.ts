@@ -1955,6 +1955,7 @@ export type Database = {
       }
       reservation_services: {
         Row: {
+          amount_paid: number
           completion_date: string | null
           cost_amount: number | null
           created_at: string
@@ -1982,6 +1983,7 @@ export type Database = {
           updated_by: string | null
         }
         Insert: {
+          amount_paid?: number
           completion_date?: string | null
           cost_amount?: number | null
           created_at?: string
@@ -2009,6 +2011,7 @@ export type Database = {
           updated_by?: string | null
         }
         Update: {
+          amount_paid?: number
           completion_date?: string | null
           cost_amount?: number | null
           created_at?: string

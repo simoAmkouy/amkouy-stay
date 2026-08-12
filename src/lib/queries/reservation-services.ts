@@ -72,6 +72,7 @@ export type ReservationServiceFormInput = {
   quantity: number;
   unitPrice: number;
   costAmount: number | null;
+  amountPaid: number;
   status: ReservationServiceStatus;
   scheduledDate?: string | null;
   scheduledTime?: string | null;
@@ -85,6 +86,7 @@ function toPayload(input: ReservationServiceFormInput) {
     quantity: input.quantity,
     unit_price: input.unitPrice,
     cost_amount: input.costAmount,
+    amount_paid: input.amountPaid,
     status: input.status,
     scheduled_date: input.scheduledDate || null,
     scheduled_time: input.scheduledTime || null,

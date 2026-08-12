@@ -42,7 +42,7 @@ import { usePayments, useReservationPaymentSummary } from '@/hooks/use-payments'
 import { supabase } from '@/lib/supabase';
 import { ReservationServiceWithRelations } from '@/lib/queries/reservation-services';
 import { ReservationPaymentSummary } from '@/lib/queries/payments';
-import { generatePdf } from '@/lib/export/pdf';
+import { generatePdf, sharePdf } from '@/lib/export/pdf';
 import { getLogoDataUri } from '@/lib/export/logo-data-uri';
 import {
   ReservationFormValues,
@@ -123,17 +123,22 @@ function formatDate(iso: string): string {
 }
 
 // ---------------------------------------------------------------------------
-// PDF HTML builder — mirrors owner-statement-pdf.ts; no formulas recomputed.
+// Client-facing invoice — compact one-page A4 design, no internal data.
+// All values come from existing hooks; nothing is recomputed here.
 // ---------------------------------------------------------------------------
 
 const BRAND_PRIMARY = '#0F1F3D';
-const BRAND_GOLD = '#C9A84C';
+const BRAND_GOLD    = '#C9A84C';
 
-function buildReservationPdfHtml(params: {
+function esc(s: string): string {
+  return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+}
+
+type InvoiceParams = {
   reservationCode: string;
-  status: string;
   guestName: string;
   guestPhone: string | null | undefined;
+  guestEmail: string | null | undefined;
   adults: number;
   children: number;
   checkIn: string;
@@ -148,139 +153,392 @@ function buildReservationPdfHtml(params: {
   cleaningFeeAmount: number;
   totalAmount: number;
   services: ReservationServiceWithRelations[];
+  payments: import('@/lib/queries/payments').PaymentRow[];
   paymentSummary: ReservationPaymentSummary | undefined;
   logoDataUri?: string;
-}): string {
+};
+
+function buildInvoiceHtml(p: InvoiceParams): string {
   const {
-    reservationCode, status, guestName, guestPhone, adults, children,
+    reservationCode, guestName, guestPhone, guestEmail, adults, children,
     checkIn, checkOut, nights, channelName, propertyName, propertyCity,
     specialRequests, nightlyRate, subtotalAmount, cleaningFeeAmount, totalAmount,
-    services, paymentSummary, logoDataUri,
-  } = params;
+    services, payments, paymentSummary, logoDataUri,
+  } = p;
 
-  const generatedAt = new Date().toLocaleString('fr-FR', { dateStyle: 'long', timeStyle: 'short' });
-  const bs = statusBadge(status);
+  const nightCount   = nights ?? 0;
+  const issueDate    = new Date().toLocaleDateString('fr-FR', { day: '2-digit', month: 'long', year: 'numeric' });
+  const propertyLine = ([propertyName, propertyCity].filter(Boolean) as string[]).map(esc).join(' — ');
+  const travellerText = adults + ' adulte' + (adults > 1 ? 's' : '') +
+    (children > 0 ? ' + ' + children + ' enfant' + (children > 1 ? 's' : '') : '');
 
-  const activeServices = services.filter(
-    (s) => s.status !== 'cancelled' && s.status !== 'refunded'
-  );
-  const servicesTotal = activeServices.reduce((sum, s) => sum + (s.total_price ?? 0), 0);
+  const activeServices = services.filter(s => s.status !== 'cancelled' && s.status !== 'refunded');
+  const servicesSubtotal = activeServices.reduce((sum, s) => sum + (s.total_price ?? 0), 0);
+  // Grand total = accommodation total (nightly+cleaning) + active services
+  const grandTotal = totalAmount + servicesSubtotal;
 
-  const travellerText = `${adults} adulte${adults > 1 ? 's' : ''}${
-    children > 0 ? ` · ${children} enfant${children > 1 ? 's' : ''}` : ''
-  }`;
+  // Per-service paid amounts (new amount_paid field) + global paid amounts
+  const servicesPaid   = activeServices.reduce((sum, s) => sum + (s.amount_paid ?? 0), 0);
+  const grandTotalPaid = (paymentSummary?.netCollected ?? 0) + servicesPaid;
+  const invoiceBalance = Math.max(0, grandTotal - grandTotalPaid);
+  const isFullyPaid    = grandTotalPaid > 0 && invoiceBalance <= 0;
 
-  const serviceRows = activeServices
-    .map(
-      (s) =>
-        `<tr>
-          <td>${s.service?.name ?? '—'}</td>
-          <td style="text-align:center">${s.quantity}</td>
-          <td style="text-align:right">${formatMAD(s.unit_price)}</td>
-          <td style="text-align:right;font-weight:600">${formatMAD(s.total_price ?? 0)}</td>
-        </tr>`
-    )
-    .join('');
+  // ── Status badge helper ──
+  const mkBadge = (lbl: string, cls: string) => `<span class="st ${cls}">${lbl}</span>`;
 
-  return `
-<!DOCTYPE html>
-<html>
+  // ── Accommodation payment status ──
+  // All payments[] rows are accommodation-level (design of the payments system).
+  // Cleaning fee is bundled with nights in totalAmount and tracked together.
+  const accPayé  = paymentSummary?.netCollected ?? 0;
+  const accReste = Math.max(0, totalAmount - accPayé);
+  const accBadgeHtml = accPayé <= 0       ? mkBadge('NON PAYÉ', 'st-unpd')
+    : accPayé >= totalAmount              ? mkBadge('PAYÉ',     'st-paid')
+    :                                       mkBadge('ACOMPTE',  'st-part');
+  const accLabel   = cleaningFeeAmount > 0 ? 'Hébergement &amp; Ménage' : 'Hébergement';
+  const accCalcSub = cleaningFeeAmount > 0
+    ? `${nightCount} nuit${nightCount !== 1 ? 's' : ''} × ${formatMAD(nightlyRate)} + ${formatMAD(cleaningFeeAmount)} ménage`
+    : `${nightCount} nuit${nightCount !== 1 ? 's' : ''} × ${formatMAD(nightlyRate)}`;
+
+  // ── Prestations rows (5 columns: Description | Total | Payé | Reste | Statut) ──
+  const prestRows = [
+    `<tr>
+      <td class="desc">${accLabel}<br/><span class="sub">${accCalcSub}</span></td>
+      <td class="amt">${formatMAD(totalAmount)}</td>
+      <td class="pmtamt">${formatMAD(accPayé)}</td>
+      <td class="pmtamt">${formatMAD(accReste)}</td>
+      <td class="stcol">${accBadgeHtml}</td>
+    </tr>`,
+    ...activeServices.map(s => {
+      const svcPayé = s.amount_paid ?? 0;
+      const svcTotal = s.total_price ?? 0;
+      const svcReste = Math.max(0, svcTotal - svcPayé);
+      const svcBadgeHtml = svcPayé >= svcTotal && svcTotal > 0 ? mkBadge('PAYÉ ✓', 'st-paid')
+        : svcPayé > 0 ? mkBadge('ACOMPTE', 'st-part')
+        : mkBadge('NON PAYÉ', 'st-unpd');
+      const calcSub = [
+        s.quantity > 1 ? `${s.quantity} × ${formatMAD(s.unit_price)}` : '',
+        s.scheduled_date ? formatDate(s.scheduled_date) : '',
+      ].filter(Boolean).join(' · ');
+      const opStatusLabel = SERVICE_STATUS_LABELS[s.status] ?? s.status;
+      return `<tr>
+        <td class="desc">${esc(s.service?.name ?? '—')}<span class="svc-op-st">${opStatusLabel}</span>${calcSub ? `<br/><span class="sub">${calcSub}</span>` : ''}</td>
+        <td class="amt">${formatMAD(svcTotal)}</td>
+        <td class="pmtamt">${formatMAD(svcPayé)}</td>
+        <td class="pmtamt">${formatMAD(svcReste)}</td>
+        <td class="stcol">${svcBadgeHtml}</td>
+      </tr>`;
+    }),
+  ].join('');
+
+  // ── Payment rows for fin-table (2-column: description + amount) ──
+  const payFinRows = payments
+    .filter(pay => pay.status !== 'failed')
+    .map(pay => {
+      const isRefund = pay.type === 'refund' || pay.type === 'deposit_release';
+      const method = PAYMENT_METHOD_LABELS[pay.method] ?? pay.method;
+      const date = pay.processed_at ? formatDate(pay.processed_at.slice(0, 10)) : '';
+      const label = [PAYMENT_TYPE_LABELS[pay.type] ?? pay.type, method, date]
+        .filter(Boolean).join(' · ');
+      return `<tr class="${isRefund ? 'red' : 'green'}">
+        <td>${label}</td>
+        <td>${isRefund ? '− ' : ''}${formatMAD(pay.amount)}</td>
+      </tr>`;
+    }).join('');
+
+  // ── Service payment rows in payment section ──
+  const svcPmtRows = activeServices
+    .filter(s => (s.amount_paid ?? 0) > 0)
+    .map(s => `<tr class="green">
+      <td>Paiement · ${esc(s.service?.name ?? '—')}</td>
+      <td>${formatMAD(s.amount_paid ?? 0)}</td>
+    </tr>`).join('');
+
+  return `<!DOCTYPE html>
+<html lang="fr">
 <head>
 <meta charset="utf-8"/>
 <style>
-  body { font-family: -apple-system, Helvetica, Arial, sans-serif; color: #1a1a1a; padding: 32px; font-size: 13px; }
-  .header { display: flex; justify-content: space-between; align-items: center; border-bottom: 3px solid ${BRAND_GOLD}; padding-bottom: 16px; margin-bottom: 20px; }
-  .brand-block { display: flex; align-items: center; gap: 12px; }
-  .brand-logo { height: 44px; width: auto; object-fit: contain; }
-  .brand { font-size: 22px; font-weight: 800; color: ${BRAND_PRIMARY}; letter-spacing: 0.5px; }
-  .brand-sub { font-size: 11px; color: #888; margin-top: 2px; }
-  .doc-info { text-align: right; font-size: 12px; color: #555; }
-  h1 { font-size: 18px; color: ${BRAND_PRIMARY}; margin: 0 0 6px; }
-  .status-badge { display: inline-block; padding: 3px 10px; border-radius: 10px; font-size: 12px; font-weight: 600; background: ${bs.bg}; color: ${bs.text}; border: 1px solid ${bs.border}; margin-bottom: 16px; }
-  h2 { font-size: 12px; text-transform: uppercase; letter-spacing: 0.5px; color: ${BRAND_PRIMARY}; border-bottom: 1px solid #e2e2e2; padding-bottom: 5px; margin-top: 20px; margin-bottom: 8px; }
-  .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 6px 24px; margin-bottom: 4px; }
-  .field-label { color: #666; font-size: 11px; }
-  .field-value { font-weight: 600; }
-  table { width: 100%; border-collapse: collapse; font-size: 13px; }
-  th { text-align: left; padding: 5px 0; color: #666; font-weight: 600; font-size: 11px; text-transform: uppercase; border-bottom: 1px solid #e2e2e2; }
-  td { padding: 5px 0; border-bottom: 1px solid #f0f0f0; }
-  .fin td { padding: 4px 0; }
-  .fin td:first-child { color: #555; }
-  .fin td:last-child { text-align: right; font-weight: 600; }
-  .fin .total-row td { font-weight: 700; color: ${BRAND_PRIMARY}; border-top: 2px solid #e2e2e2; padding-top: 6px; }
-  .fin .paid-row td:last-child { color: #15803D; }
-  .fin .due-row td:last-child { color: #B91C1C; }
-  .notes { background: #fffbec; border: 1px solid #f3e6be; border-radius: 8px; padding: 12px 16px; font-size: 12px; color: #6a5a22; white-space: pre-wrap; }
-  .footer { margin-top: 32px; border-top: 1px solid #e2e2e2; padding-top: 10px; font-size: 10.5px; color: #999; }
+@page { size: A4 portrait; margin: 0; }
+*    { box-sizing: border-box; margin: 0; padding: 0; }
+body {
+  font-family: -apple-system, 'Helvetica Neue', Arial, sans-serif;
+  font-size: 10.5px;
+  line-height: 1.45;
+  color: #1a1a1a;
+  background: #fff;
+}
+@media print {
+  body { -webkit-print-color-adjust: exact; print-color-adjust: exact; }
+}
+.page { padding: 13mm 16mm 12mm; }
+
+/* ── Header ── */
+.hdr {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  padding-bottom: 10px;
+  margin-bottom: 12px;
+  border-bottom: 1.5px solid ${BRAND_GOLD};
+}
+.hdr-brand { display: flex; align-items: center; gap: 10px; }
+.logo      { height: 38px; width: auto; }
+.brand     { font-size: 15px; font-weight: 800; color: ${BRAND_PRIMARY}; letter-spacing: 0.3px; }
+.brand-sub { font-size: 9px; color: #999; margin-top: 2px; }
+.hdr-right { text-align: right; }
+.facture   { font-size: 20px; font-weight: 800; color: ${BRAND_PRIMARY}; letter-spacing: 1.5px; }
+.doc-ref   { font-size: 9.5px; color: #666; line-height: 1.7; margin-top: 4px; }
+.doc-ref b { color: #222; }
+
+/* ── Info grid (Client + Séjour) ── */
+.info-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 0 20px;
+  background: #f8f8f8;
+  border-radius: 5px;
+  padding: 9px 12px;
+  margin-bottom: 12px;
+}
+.info-head { font-size: 8px; font-weight: 700; text-transform: uppercase;
+             letter-spacing: 0.9px; color: ${BRAND_GOLD}; margin-bottom: 5px; }
+.info-row  { display: flex; gap: 6px; margin-bottom: 2px; align-items: baseline; }
+.lbl       { font-size: 9px; color: #888; min-width: 52px; flex-shrink: 0; }
+.val       { font-size: 9.5px; font-weight: 600; color: #1a1a1a; word-break: break-word; }
+
+/* ── Section label ── */
+.slbl {
+  font-size: 8px; font-weight: 700; text-transform: uppercase;
+  letter-spacing: 0.8px; color: ${BRAND_PRIMARY}; margin-bottom: 5px;
+}
+
+/* ── Prestations table ── */
+.pt { width: 100%; border-collapse: collapse; margin-bottom: 10px; }
+.pt thead th {
+  font-size: 8.5px; font-weight: 600; text-transform: uppercase;
+  letter-spacing: 0.3px; color: #888; padding: 3px 0;
+  border-bottom: 1px solid #ddd;
+}
+.pt thead th.amt    { text-align: right; white-space: nowrap; }
+.pt thead th.pmtamt { text-align: right; white-space: nowrap; }
+.pt thead th.stcol  { text-align: center; white-space: nowrap; }
+.pt tbody tr { page-break-inside: avoid; }
+.pt tbody tr + tr td { border-top: 1px solid #f0f0f0; }
+.pt td { padding: 5px 0; vertical-align: middle; }
+.pt td.desc   { padding-right: 8px; vertical-align: top; padding-top: 6px; }
+.pt td.amt    { text-align: right; font-weight: 600; white-space: nowrap; padding-right: 8px; }
+.pt td.pmtamt { text-align: right; color: #555; white-space: nowrap; font-size: 10px; padding-right: 8px; }
+.pt td.stcol  { text-align: center; padding-left: 4px; }
+.pt tfoot td {
+  border-top: 2px solid ${BRAND_PRIMARY}; padding-top: 6px; padding-bottom: 2px;
+  font-weight: 700; font-size: 11px; color: ${BRAND_PRIMARY};
+}
+.pt tfoot td.amt    { text-align: right; }
+.pt tfoot td.pmtamt { text-align: right; font-size: 10px; }
+.sub { font-size: 9px; color: #888; margin-top: 1px; display: block; }
+/* ── Payment status badges ── */
+.st { display: inline-block; font-size: 7px; font-weight: 800; letter-spacing: 0.4px;
+      text-transform: uppercase; padding: 2px 5px; border-radius: 3px; white-space: nowrap; }
+.st-paid { background: #DCFCE7; color: #15803D; }
+.st-part { background: #FEF3C7; color: #92400E; }
+.st-unpd { background: #FEE2E2; color: #B91C1C; }
+.st-remb { background: #F1F5F9; color: #64748B; }
+/* Operational service status chip (Accepté / Planifié / etc.) */
+.svc-op-st { display: inline-block; font-size: 7px; font-weight: 600; color: #555;
+             background: #f0f0f0; border-radius: 3px; padding: 1px 4px;
+             margin-left: 5px; vertical-align: middle; }
+
+/* ── Financial summary ── */
+.fin { width: 100%; border-collapse: collapse; margin-bottom: 8px; }
+.fin td { padding: 3px 0; font-size: 10px; }
+.fin td:last-child { text-align: right; font-weight: 600; white-space: nowrap; }
+.fin .muted td { color: #555; }
+.fin .total td {
+  font-weight: 800; font-size: 12px; color: ${BRAND_PRIMARY};
+  border-top: 2px solid ${BRAND_PRIMARY}; padding-top: 6px;
+}
+.fin .green td:last-child { color: #15803D; }
+.fin .red   td:last-child { color: #B91C1C; }
+.fin .sep   td { border-top: 1px solid #e8e8e8; padding-top: 5px; }
+
+/* ── Balance box ── */
+.bal {
+  border-radius: 6px; padding: 9px 14px; margin-top: 8px;
+  page-break-inside: avoid; display: flex;
+  justify-content: space-between; align-items: center;
+}
+.bal.due  { background: #FEF2F2; border: 1.5px solid #EF4444; }
+.bal.paid { background: #F0FDF4; border: 1.5px solid #22C55E; }
+.bal-lbl  { font-size: 8px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.8px; }
+.bal.due  .bal-lbl  { color: #B91C1C; }
+.bal.paid .bal-lbl  { color: #15803D; }
+.bal-amt  { font-size: 20px; font-weight: 800; line-height: 1; }
+.bal.due  .bal-amt  { color: #B91C1C; }
+.bal.paid .bal-amt  { color: #15803D; }
+
+/* ── Payments table ── */
+.pay { width: 100%; border-collapse: collapse; font-size: 9.5px; }
+.pay th {
+  font-size: 8px; text-transform: uppercase; letter-spacing: 0.3px;
+  color: #aaa; padding: 0 6px 4px 0; border-bottom: 1px solid #eee;
+  text-align: left;
+}
+.pay td { padding: 4px 6px 4px 0; border-bottom: 1px solid #f5f5f5; color: #555; }
+.pay tr:last-child td { border-bottom: none; }
+.pay td:last-child { text-align: right; padding-right: 0; }
+
+/* ── Special requests ── */
+.notes {
+  background: #fffbec; border: 1px solid #f3e6be; border-radius: 4px;
+  padding: 7px 10px; font-size: 9.5px; color: #6a5a22;
+  white-space: pre-wrap; word-break: break-word; page-break-inside: avoid;
+}
+
+/* ── Divider ── */
+.div { border: none; border-top: 1px solid #e8e8e8; margin: 10px 0; }
+
+/* ── Footer ── */
+.ftr {
+  margin-top: 14px; padding-top: 9px;
+  border-top: 1.5px solid ${BRAND_GOLD};
+  display: flex; justify-content: space-between; align-items: flex-start;
+}
+.ftr-brand { font-size: 11px; font-weight: 700; color: ${BRAND_PRIMARY}; }
+.ftr-sub   { font-size: 9px; color: #aaa; margin-top: 1px; }
+.ftr-right { text-align: right; font-size: 9.5px; color: #555; line-height: 1.7; }
+.ftr-thank { text-align: center; font-size: 9px; color: #888; font-style: italic; margin-bottom: 8px; }
 </style>
 </head>
 <body>
-  <div class="header">
-    <div class="brand-block">
-      ${logoDataUri ? `<img class="brand-logo" src="${logoDataUri}" alt="Amkouy Stay"/>` : ''}
-      <div>
-        <div class="brand">AMKOUY STAY</div>
-        <div class="brand-sub">Gestion immobilière &amp; conciergerie</div>
-      </div>
+<div class="page">
+
+<!-- HEADER -->
+<div class="hdr">
+  <div class="hdr-brand">
+    ${logoDataUri ? `<img class="logo" src="${logoDataUri}" alt="Amkouy Stay"/>` : ''}
+    <div>
+      <div class="brand">AMKOUY STAY</div>
+      <div class="brand-sub">Property Management &amp; Concierge · Agadir · Morocco</div>
     </div>
-    <div class="doc-info">Réservation<br/>${formatDate(checkIn)} → ${formatDate(checkOut)}</div>
   </div>
-
-  <h1>${reservationCode}</h1>
-  <div class="status-badge">${STATUS_LABELS[status] ?? status}</div>
-
-  <h2>Client</h2>
-  <div class="grid">
-    <div><div class="field-label">Nom</div><div class="field-value">${guestName}</div></div>
-    ${guestPhone ? `<div><div class="field-label">Téléphone</div><div class="field-value">${guestPhone}</div></div>` : ''}
-    <div><div class="field-label">Voyageurs</div><div class="field-value">${travellerText}</div></div>
+  <div class="hdr-right">
+    <div class="facture">FACTURE</div>
+    <div class="doc-ref">
+      Réf. <b>${esc(reservationCode)}</b><br/>
+      Émis le ${issueDate}
+    </div>
   </div>
+</div>
 
-  <h2>Séjour</h2>
-  <div class="grid">
-    <div><div class="field-label">Arrivée</div><div class="field-value">${formatDate(checkIn)}</div></div>
-    <div><div class="field-label">Départ</div><div class="field-value">${formatDate(checkOut)}</div></div>
-    <div><div class="field-label">Nuits</div><div class="field-value">${nights ?? '—'}</div></div>
-    ${channelName ? `<div><div class="field-label">Canal</div><div class="field-value">${channelName}</div></div>` : ''}
-    ${propertyName ? `<div><div class="field-label">Bien</div><div class="field-value">${propertyName}${propertyCity ? ` — ${propertyCity}` : ''}</div></div>` : ''}
+<!-- CLIENT + SÉJOUR -->
+<div class="info-grid">
+  <div>
+    <div class="info-head">Client</div>
+    <div class="info-row"><span class="lbl">Nom</span><span class="val">${esc(guestName)}</span></div>
+    ${guestPhone ? `<div class="info-row"><span class="lbl">Tél.</span><span class="val">${esc(guestPhone)}</span></div>` : ''}
+    ${guestEmail ? `<div class="info-row"><span class="lbl">Email</span><span class="val">${esc(guestEmail)}</span></div>` : ''}
+    <div class="info-row"><span class="lbl">Voyageurs</span><span class="val">${esc(travellerText)}</span></div>
   </div>
+  <div>
+    <div class="info-head">Séjour</div>
+    ${propertyLine ? `<div class="info-row"><span class="lbl">Bien</span><span class="val">${propertyLine}</span></div>` : ''}
+    <div class="info-row"><span class="lbl">Arrivée</span><span class="val">${formatDate(checkIn)}</span></div>
+    <div class="info-row"><span class="lbl">Départ</span><span class="val">${formatDate(checkOut)}</span></div>
+    <div class="info-row"><span class="lbl">Durée</span><span class="val">${nightCount} nuit${nightCount !== 1 ? 's' : ''}</span></div>
+    ${channelName ? `<div class="info-row"><span class="lbl">Canal</span><span class="val">${esc(channelName)}</span></div>` : ''}
+  </div>
+</div>
 
-  <h2>Finances hébergement</h2>
-  <table class="fin">
-    <tr><td>${formatMAD(nightlyRate)}/nuit × ${nights ?? 0} nuits</td><td>${formatMAD(subtotalAmount)}</td></tr>
-    ${cleaningFeeAmount > 0 ? `<tr><td>Frais ménage</td><td>${formatMAD(cleaningFeeAmount)}</td></tr>` : ''}
-    <tr class="total-row"><td>Total logement</td><td>${formatMAD(totalAmount)}</td></tr>
-  </table>
+<!-- PRESTATIONS (5 colonnes: Description | Total | Payé | Reste | Statut) -->
+<div class="slbl">Prestations</div>
+<table class="pt">
+  <thead>
+    <tr>
+      <th style="text-align:left;width:34%">Description</th>
+      <th class="amt"    style="width:14%">Total</th>
+      <th class="pmtamt" style="width:14%">Payé</th>
+      <th class="pmtamt" style="width:14%">Reste</th>
+      <th class="stcol"  style="width:24%">Statut pmt.</th>
+    </tr>
+  </thead>
+  <tbody>${prestRows}</tbody>
+  <tfoot>
+    <tr>
+      <td>TOTAL FACTURE</td>
+      <td class="amt">${formatMAD(grandTotal)}</td>
+      <td class="pmtamt" style="color:#15803D;font-weight:800">${formatMAD(grandTotalPaid)}</td>
+      <td class="pmtamt" style="color:${invoiceBalance > 0 ? '#B91C1C' : '#15803D'};font-weight:800">${formatMAD(invoiceBalance)}</td>
+      <td></td>
+    </tr>
+  </tfoot>
+</table>
 
-  ${
-    activeServices.length > 0
-      ? `<h2>Services &amp; suppléments</h2>
-         <table>
-           <thead><tr><th>Service</th><th style="text-align:center">Qté</th><th style="text-align:right">Prix unit.</th><th style="text-align:right">Total</th></tr></thead>
-           <tbody>${serviceRows}</tbody>
-           <tfoot><tr style="font-weight:700;color:${BRAND_PRIMARY}"><td colspan="3" style="border-top:2px solid #e2e2e2;padding-top:6px">Total services</td><td style="text-align:right;border-top:2px solid #e2e2e2;padding-top:6px">${formatMAD(servicesTotal)}</td></tr></tfoot>
-         </table>`
-      : ''
-  }
+<!-- PAIEMENTS REÇUS -->
+${payments.filter(pay => pay.status !== 'failed').length > 0 || svcPmtRows ? `
+<hr class="div"/>
+<div class="slbl" style="margin-bottom:4px">Paiements reçus</div>
+<table class="fin">
+  ${payFinRows}
+  ${svcPmtRows}
+  ${grandTotalPaid > 0 ? `
+  <tr class="sep">
+    <td style="font-weight:800;font-size:11px;color:#15803D">Total encaissé</td>
+    <td style="font-weight:800;font-size:11px;color:#15803D">${formatMAD(grandTotalPaid)}</td>
+  </tr>` : ''}
+</table>` : ''}
 
-  ${
-    paymentSummary
-      ? `<h2>Paiements</h2>
-         <table class="fin">
-           ${paymentSummary.depositPaid > 0 ? `<tr><td>Acompte versé</td><td>${formatMAD(paymentSummary.depositPaid)}</td></tr>` : ''}
-           ${paymentSummary.balancePaid > 0 ? `<tr><td>Solde versé</td><td>${formatMAD(paymentSummary.balancePaid)}</td></tr>` : ''}
-           ${paymentSummary.refunded > 0 ? `<tr><td>Remboursements</td><td>- ${formatMAD(paymentSummary.refunded)}</td></tr>` : ''}
-           <tr class="total-row paid-row"><td>Net encaissé</td><td>${formatMAD(paymentSummary.netCollected)}</td></tr>
-           ${paymentSummary.outstanding > 0 ? `<tr class="due-row"><td>Reste dû</td><td>${formatMAD(paymentSummary.outstanding)}</td></tr>` : ''}
-         </table>`
-      : ''
-  }
+${paymentSummary ? `
+<div class="bal ${isFullyPaid ? 'paid' : 'due'}">
+  <div>
+    <div class="bal-lbl">${isFullyPaid ? 'Payé intégralement' : 'Reste à payer'}</div>
+    ${!isFullyPaid ? `<div style="font-size:9px;color:#888;margin-top:2px">Montant dû à la date de séjour</div>` : ''}
+  </div>
+  <div class="bal-amt">${isFullyPaid ? 'PAYÉ ✓' : formatMAD(invoiceBalance)}</div>
+</div>` : ''}
 
-  ${specialRequests ? `<h2>Demandes spéciales</h2><div class="notes">${specialRequests.replace(/</g, '&lt;')}</div>` : ''}
+${specialRequests ? `
+<hr class="div"/>
+<div class="slbl" style="margin-bottom:4px">Demandes spéciales</div>
+<div class="notes">${esc(specialRequests)}</div>` : ''}
 
-  <div class="footer">Document généré le ${generatedAt} — Amkouy Stay</div>
+<div class="ftr-thank">Merci de votre confiance. Nous sommes ravis de vous accueillir à Agadir.</div>
+<div class="ftr">
+  <div>
+    <div class="ftr-brand">AMKOUY STAY</div>
+    <div class="ftr-sub">Property Management &amp; Concierge · Agadir · Morocco</div>
+  </div>
+  <div class="ftr-right">Tél&nbsp;: 0662205930<br/>Réf. ${esc(reservationCode)}</div>
+</div>
+
+</div><!-- /.page -->
 </body>
 </html>`;
+}
+
+/** Plain-text WhatsApp message built from the same data as the invoice. */
+function buildWhatsappText(p: InvoiceParams): string {
+  const activeSvcs = p.services.filter(s => s.status !== 'cancelled' && s.status !== 'refunded');
+  const total = p.totalAmount + activeSvcs.reduce((sum, s) => sum + (s.total_price ?? 0), 0);
+  const svcPaid = activeSvcs.reduce((sum, s) => sum + (s.amount_paid ?? 0), 0);
+  const totalPaid = (p.paymentSummary?.netCollected ?? 0) + svcPaid;
+  const balance = Math.max(0, total - totalPaid);
+  const propertyLine = [p.propertyName, p.propertyCity].filter(Boolean).join(', ');
+  return [
+    `Bonjour ${p.guestName},`,
+    '',
+    'Veuillez trouver ci-joint votre facture AMKOUY Stay.',
+    '',
+    `Réf. : ${p.reservationCode}`,
+    propertyLine ? `Bien : ${propertyLine}` : '',
+    `Séjour : ${formatDate(p.checkIn)} → ${formatDate(p.checkOut)}`,
+    `Total : ${formatMAD(total)}`,
+    balance > 0 ? `Reste à payer : ${formatMAD(balance)}` : 'Payé intégralement ✓',
+    '',
+    'Merci pour votre confiance.',
+    '',
+    'AMKOUY Stay',
+    'Tél. 0662205930',
+  ].filter(line => line !== null).join('\n');
 }
 
 // ---------------------------------------------------------------------------
@@ -342,6 +600,7 @@ export function ReservationDetailCard({
   const [editFormVisible, setEditFormVisible] = useState(false);
   const [actionPending, setActionPending] = useState<ReservationStatusValue | null>(null);
   const [printing, setPrinting] = useState(false);
+  const [sharing, setSharing]   = useState(false);
 
   // Existing hook — fetches reservation with property/guest/channel joins
   const { data: reservation, isLoading, error } = useReservation(reservationId ?? undefined);
@@ -456,38 +715,60 @@ export function ReservationDetailCard({
     }
   }
 
+  function buildInvoiceParams(logoDataUri?: string): InvoiceParams {
+    return {
+      reservationCode:   reservation!.reservation_code,
+      guestName:         reservation!.guest?.full_name ?? '—',
+      guestPhone:        reservation!.guest?.phone,
+      guestEmail:        (reservation!.guest as any)?.email,
+      adults:            reservation!.adults,
+      children:          reservation!.children,
+      checkIn:           reservation!.check_in_date,
+      checkOut:          reservation!.check_out_date,
+      nights:            reservation!.nights,
+      channelName:       reservation!.channel?.name,
+      propertyName:      reservation!.property?.name,
+      propertyCity:      reservation!.property?.city,
+      specialRequests:   reservation!.special_requests,
+      nightlyRate:       reservation!.nightly_rate,
+      subtotalAmount:    reservation!.subtotal_amount,
+      cleaningFeeAmount: reservation!.cleaning_fee_amount,
+      totalAmount:       reservation!.total_amount,
+      services:          services ?? [],
+      payments:          payments ?? [],
+      paymentSummary,
+      logoDataUri,
+    };
+  }
+
   async function handlePrint() {
     if (!reservation) return;
     setPrinting(true);
     try {
       const logoDataUri = await getLogoDataUri().catch(() => undefined);
-      const html = buildReservationPdfHtml({
-        reservationCode:   reservation.reservation_code,
-        status:            reservation.status,
-        guestName:         reservation.guest?.full_name ?? '—',
-        guestPhone:        reservation.guest?.phone,
-        adults:            reservation.adults,
-        children:          reservation.children,
-        checkIn:           reservation.check_in_date,
-        checkOut:          reservation.check_out_date,
-        nights:            reservation.nights,
-        channelName:       reservation.channel?.name,
-        propertyName:      reservation.property?.name,
-        propertyCity:      reservation.property?.city,
-        specialRequests:   reservation.special_requests,
-        nightlyRate:       reservation.nightly_rate,
-        subtotalAmount:    reservation.subtotal_amount,
-        cleaningFeeAmount: reservation.cleaning_fee_amount,
-        totalAmount:       reservation.total_amount,
-        services:          services ?? [],
-        paymentSummary,
-        logoDataUri,
-      });
-      await generatePdf(`RESERVATION-${reservation.reservation_code}.pdf`, html);
+      const invoiceParams = buildInvoiceParams(logoDataUri);
+      const html = buildInvoiceHtml(invoiceParams);
+      await generatePdf(`FACTURE-${reservation.reservation_code}.pdf`, html);
     } catch {
       Alert.alert('Erreur', 'Impossible de générer le PDF');
     } finally {
       setPrinting(false);
+    }
+  }
+
+  async function handleShare() {
+    if (!reservation) return;
+    setSharing(true);
+    try {
+      const logoDataUri = await getLogoDataUri().catch(() => undefined);
+      const invoiceParams = buildInvoiceParams(logoDataUri);
+      const html = buildInvoiceHtml(invoiceParams);
+      const whatsappText = buildWhatsappText(invoiceParams);
+      await sharePdf(`FACTURE-${reservation.reservation_code}.pdf`, html, whatsappText);
+    } catch {
+      Alert.alert('Erreur', 'Impossible de partager la facture');
+    } finally {
+      setSharing(false);
     }
   }
 
@@ -791,7 +1072,7 @@ export function ReservationDetailCard({
                 <TouchableOpacity
                   style={[styles.actionBtn, styles.printBtn]}
                   onPress={handlePrint}
-                  disabled={printing}
+                  disabled={printing || sharing}
                   activeOpacity={0.8}
                 >
                   {printing ? (
@@ -800,6 +1081,21 @@ export function ReservationDetailCard({
                     <>
                       <Icon name="print" size={16} color="#374151" />
                       <Text style={styles.printBtnText}>PDF</Text>
+                    </>
+                  )}
+                </TouchableOpacity>
+                <TouchableOpacity
+                  style={[styles.actionBtn, styles.shareBtn]}
+                  onPress={handleShare}
+                  disabled={printing || sharing}
+                  activeOpacity={0.8}
+                >
+                  {sharing ? (
+                    <ActivityIndicator size="small" color={AmkouyColors.primary} />
+                  ) : (
+                    <>
+                      <Icon name="share" size={16} color={AmkouyColors.primary} />
+                      <Text style={styles.shareBtnText}>Partager</Text>
                     </>
                   )}
                 </TouchableOpacity>
@@ -1111,6 +1407,15 @@ const styles = StyleSheet.create({
   },
   printBtnText: {
     ...robotoText(600, 13, { color: '#374151' }),
+  },
+  shareBtn: {
+    flex: 1,
+    backgroundColor: AmkouyColors.secondaryContainer,
+    borderWidth: 1,
+    borderColor: AmkouyColors.secondary,
+  },
+  shareBtnText: {
+    ...robotoText(600, 14, { color: AmkouyColors.primary }),
   },
   viewBtn: {
     flex: 2,

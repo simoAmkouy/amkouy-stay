@@ -24,6 +24,7 @@ const DEFAULTS: ReservationServiceFormValues = {
   quantity: 1,
   unitPrice: 0,
   costAmount: null,
+  amountPaid: 0,
   status: 'offered',
   scheduledDate: '',
   scheduledTime: '',
@@ -66,8 +67,16 @@ export function ReservationServiceForm({
   const quantity = useWatch({ control, name: 'quantity' });
   const unitPrice = useWatch({ control, name: 'unitPrice' });
   const costAmount = useWatch({ control, name: 'costAmount' });
+  const amountPaidWatched = useWatch({ control, name: 'amountPaid' });
   const total = (quantity || 0) * (unitPrice || 0);
   const profit = total - (costAmount || 0);
+  const reste = Math.max(0, total - (amountPaidWatched || 0));
+  const paidStatus: 'NON PAYÉ' | 'ACOMPTE' | 'PAYÉ' =
+    (amountPaidWatched || 0) <= 0
+      ? 'NON PAYÉ'
+      : (amountPaidWatched || 0) >= total && total > 0
+        ? 'PAYÉ'
+        : 'ACOMPTE';
 
   const selectedService = (services ?? []).find((s) => s.id === serviceId);
   const activeProviders = (providers ?? []).filter((p) => p.status === 'active');
@@ -178,6 +187,46 @@ export function ReservationServiceForm({
         </View>
       </View>
 
+      <View style={styles.sectionHeader}>
+        <Text style={styles.sectionTitle}>Paiement client</Text>
+      </View>
+
+      <Controller
+        control={control}
+        name="amountPaid"
+        render={({ field }) => (
+          <NumberField
+            label="Montant payé (MAD)"
+            value={field.value}
+            onChangeValue={(v) => field.onChange(v ?? 0)}
+            error={errors.amountPaid?.message}
+          />
+        )}
+      />
+
+      <View style={styles.paymentInfoRow}>
+        <View style={styles.paymentInfoBlock}>
+          <Text style={styles.paymentInfoLabel}>Reste à payer</Text>
+          <Text style={[styles.paymentInfoValue, { color: reste > 0 ? AmkouyColors.error : AmkouyColors.success }]}>
+            {formatMAD(reste)}
+          </Text>
+        </View>
+        <View style={styles.paymentInfoBlock}>
+          <Text style={styles.paymentInfoLabel}>Statut paiement</Text>
+          <Text
+            style={[
+              styles.paidStatusBadge,
+              paidStatus === 'PAYÉ'
+                ? styles.paidStatusPaid
+                : paidStatus === 'ACOMPTE'
+                  ? styles.paidStatusPartial
+                  : styles.paidStatusUnpaid,
+            ]}>
+            {paidStatus}
+          </Text>
+        </View>
+      </View>
+
       {selectedService?.requires_scheduling && (
         <View style={styles.row}>
           <View style={styles.flex}>
@@ -246,5 +295,51 @@ const styles = StyleSheet.create({
   },
   totalValue: {
     ...robotoText(900, 16, { color: AmkouyColors.primary, marginTop: 2 }),
+  },
+  sectionHeader: {
+    borderTopWidth: 1,
+    borderTopColor: AmkouyColors.hairline,
+    marginTop: 8,
+    paddingTop: 16,
+  },
+  sectionTitle: {
+    ...robotoText(700, 12, { color: AmkouyColors.textMuted, textTransform: 'uppercase', letterSpacing: 0.6 }),
+  },
+  paymentInfoRow: {
+    flexDirection: 'row',
+    gap: 12,
+    marginTop: 8,
+  },
+  paymentInfoBlock: {
+    flex: 1,
+    backgroundColor: AmkouyColors.hairline,
+    borderRadius: 10,
+    paddingHorizontal: 14,
+    paddingVertical: 10,
+  },
+  paymentInfoLabel: {
+    ...robotoText(600, 10, { color: AmkouyColors.textMuted }),
+  },
+  paymentInfoValue: {
+    ...robotoText(700, 15, { marginTop: 2 }),
+  },
+  paidStatusBadge: {
+    ...robotoText(700, 11, { marginTop: 4, alignSelf: 'flex-start' as const }),
+    paddingHorizontal: 8,
+    paddingVertical: 3,
+    borderRadius: 5,
+    overflow: 'hidden',
+  },
+  paidStatusPaid: {
+    backgroundColor: '#DCFCE7',
+    color: '#15803D',
+  },
+  paidStatusPartial: {
+    backgroundColor: '#FEF3C7',
+    color: '#92400E',
+  },
+  paidStatusUnpaid: {
+    backgroundColor: '#FEE2E2',
+    color: '#B91C1C',
   },
 });
