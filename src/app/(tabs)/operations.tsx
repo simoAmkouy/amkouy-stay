@@ -66,6 +66,7 @@ import { DISPLAY_STATUS_OPTIONS } from '@/lib/validation/owner-payment';
 import { SERVICE_STATUS_OPTIONS } from '@/lib/validation/reservation-service';
 import { computeRangeForFilter, toDateOnlyString } from '@/utils/date-range';
 import { formatMAD } from '@/utils/format';
+import { IntelligencePanel } from '@/components/intelligence/IntelligencePanel';
 
 const CLEANING_STATUS_LABEL = Object.fromEntries(CLEANING_STATUS_OPTIONS.map((o) => [o.value, o.label]));
 const MAINTENANCE_STATUS_LABEL = Object.fromEntries(MAINTENANCE_STATUS_OPTIONS.map((o) => [o.value, o.label]));
@@ -778,6 +779,9 @@ function OperationsContent() {
           />
         )}
       </View>
+
+      {/* ===== AMKOUY INTELLIGENCE (Phase 1) ===== */}
+      <IntelligencePanel range={range} />
     </Screen>
   );
 

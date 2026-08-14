@@ -27,7 +27,8 @@ export type Resource =
   | 'property_activation'
   | 'team_management'
   | 'archived_items'
-  | 'executive_command_center';
+  | 'executive_command_center'
+  | 'intelligence';
 
 const ALL_RESOURCES: Resource[] = [
   'dashboard',
@@ -53,6 +54,7 @@ const ALL_RESOURCES: Resource[] = [
   'team_management',
   'archived_items',
   'executive_command_center',
+  'intelligence',
 ];
 
 /**
@@ -63,7 +65,7 @@ const ALL_RESOURCES: Resource[] = [
 export const ROLE_PERMISSIONS: Record<UserRole, Resource[]> = {
   super_admin: ALL_RESOURCES,
   admin: ALL_RESOURCES,
-  manager: ['dashboard', 'operations', 'properties', 'reservations', 'owners', 'cleaning', 'maintenance', 'concierge', 'concierge_reports', 'contracts', 'reports', 'commercial_leads', 'reservation_leads', 'commercial_management', 'property_activation', 'team_management'],
+  manager: ['dashboard', 'operations', 'properties', 'reservations', 'owners', 'cleaning', 'maintenance', 'concierge', 'concierge_reports', 'contracts', 'reports', 'commercial_leads', 'reservation_leads', 'commercial_management', 'property_activation', 'team_management', 'intelligence'],
   // Read-only in practice: the Operations Center hides every Quick Action (assign/verify/etc.)
   // for accountants at the component level, since `canAccess` is a binary resource gate, not a
   // read/write distinction. Same treatment for `contracts`: the Contracts screens hide
@@ -73,7 +75,7 @@ export const ROLE_PERMISSIONS: Record<UserRole, Resource[]> = {
   // is a read + export, so accountant gets the same full list as manager/admin.
   // `commercial_management` here is specifically for commission approval/payment (commercial_commissions
   // insert/update RLS is `is_staff() OR is_finance()`, and accountant is_finance() — matches).
-  accountant: ['dashboard', 'operations', 'finance', 'expenses', 'owner_payments', 'concierge_reports', 'contracts', 'reports', 'commercial_management', 'property_activation', 'team_management'],
+  accountant: ['dashboard', 'operations', 'finance', 'expenses', 'owner_payments', 'concierge_reports', 'contracts', 'reports', 'commercial_management', 'property_activation', 'team_management', 'intelligence'],
   // Owner reporting (Phase 7) is not a separate `reports` grant — it lives inside `owner_portal`,
   // using column/row-restricted RPC calls (RLS + narrower query shapes), never the staff `reports`
   // screens, so an owner can never reach the portfolio/property-performance views even by URL.
