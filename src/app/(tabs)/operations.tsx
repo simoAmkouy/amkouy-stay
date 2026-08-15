@@ -249,6 +249,9 @@ function OperationsContent() {
 
       <DateFilterBar />
 
+      {/* ===== AMKOUY INTELLIGENCE (Phase 1) ===== */}
+      <IntelligencePanel range={range} />
+
       {/* ===== EXECUTIVE SUMMARY ===== */}
       <Text style={styles.sectionTitle}>{t('operations.executiveSummary')}</Text>
       <View style={styles.execSummaryGrid}>
@@ -779,9 +782,6 @@ function OperationsContent() {
           />
         )}
       </View>
-
-      {/* ===== AMKOUY INTELLIGENCE (Phase 1) ===== */}
-      <IntelligencePanel range={range} />
     </Screen>
   );
 
