@@ -8,10 +8,17 @@ import { robotoText } from '@/constants/typography';
 import { useAuth } from '@/hooks/use-auth';
 import { usePortfolioReport } from '@/hooks/use-reports';
 import { DateRange } from '@/utils/date-range';
-import { formatMAD } from '@/utils/format';
 
 interface Props {
   range: DateRange;
+}
+
+// ─── Local MAD formatter ──────────────────────────────────────────────────────
+// Scoped to Intelligence only — does NOT modify the shared formatMAD utility.
+// Caps at 2 decimal places; uses fr-FR locale (space thousands, comma decimal).
+// Examples: 766 → "MAD 766", 716.581 → "MAD 716,58", 22214 → "MAD 22 214"
+function fmtMAD(value: number): string {
+  return `MAD ${value.toLocaleString('fr-FR', { maximumFractionDigits: 2 })}`;
 }
 
 // ─── Tooltip content ─────────────────────────────────────────────────────────
@@ -77,69 +84,88 @@ function IntelligenceContent({ range }: Props) {
   const daysInRange = Math.max(1, differenceInCalendarDays(range.end, range.start) + 1);
   const s = report?.summary;
 
+  // Data-sufficiency guards — used to distinguish "no data" from "poor performance"
+  // ADR requires occupied nights as its denominator; without them the value is 0 but not meaningful.
+  const hasNightsData = (s?.totalNights ?? 0) > 0;
+  // Occupancy, RevPAN, and the cancellation rate all require at least one reservation.
+  const hasReservationData = (s?.totalReservations ?? 0) > 0;
+
   const revPAN =
-    s && s.activeProperties > 0
+    s && hasReservationData && s.activeProperties > 0
       ? s.totalNetRevenue / (daysInRange * s.activeProperties)
       : 0;
 
-  const kpiValue = (key: string): number => {
-    if (!s) return 0;
+  // Returns the formatted display string for a KPI card.
+  // "Données insuffisantes" is only shown when the underlying denominator is zero,
+  // making the metric undefined — NOT when the metric is genuinely zero but meaningful
+  // (e.g. zero profit or zero concierge revenue are valid values).
+  const kpiDisplay = (key: string): string => {
+    if (!s) return '—';
     switch (key) {
-      case 'adr': return s.adr;
-      case 'occupancy': return s.occupancyRate;
-      case 'revpan': return revPAN;
-      case 'profit': return s.totalProfit;
-      case 'concierge': return s.totalConciergeRevenue;
-      default: return 0;
+      case 'adr':
+        return hasNightsData ? fmtMAD(s.adr) : 'Données insuffisantes';
+      case 'occupancy':
+        return hasReservationData ? `${s.occupancyRate.toFixed(1)} %` : 'Données insuffisantes';
+      case 'revpan':
+        return hasReservationData ? fmtMAD(revPAN) : 'Données insuffisantes';
+      case 'profit':
+        return fmtMAD(s.totalProfit); // zero profit is a meaningful value
+      case 'concierge':
+        return fmtMAD(s.totalConciergeRevenue); // zero concierge is a meaningful value
+      default:
+        return '—';
     }
   };
 
-  const kpiFormatted = (key: string, value: number): string => {
-    if (key === 'occupancy') return `${value.toFixed(1)} %`;
-    return formatMAD(value);
+  // Whether a KPI's display value is in "insufficient data" state (used for styling).
+  const kpiInsufficient = (key: string): boolean => {
+    if (!s) return false;
+    if (key === 'adr' || key === 'revpan') return !hasNightsData;
+    if (key === 'occupancy') return !hasReservationData;
+    return false;
   };
 
-  // Analyse tarifaire — read-only threshold alerts
+  // Analyse tarifaire — read-only threshold alerts.
+  // Each alert is only emitted when its underlying metric has a valid denominator,
+  // to avoid misclassifying a "no data" period as genuinely poor performance.
   const alerts: { key: string; text: string; warning: boolean }[] = [];
   if (s) {
-    if (s.occupancyRate < 60 && s.totalReservations > 0) {
+    // Occupancy alert: only when Core reported at least one reservation (valid denominator).
+    if (hasReservationData && s.occupancyRate < 60) {
       alerts.push({
         key: 'low_occ',
         text: `Taux d'occupation faible (${s.occupancyRate.toFixed(1)} %). Analyse tarifaire recommandée : vérifiez vos prix minimum et vos fenêtres de disponibilité.`,
         warning: true,
       });
     }
-    if (s.adr < 300 && s.totalReservations > 0) {
+    // ADR alert: only when Core reported at least one occupied night (valid denominator).
+    if (hasNightsData && s.adr < 300) {
       alerts.push({
         key: 'low_adr',
-        text: `ADR bas (${formatMAD(s.adr)}). Revoyez vos tarifs de base ou vos politiques de remise sur les longs séjours.`,
+        text: `ADR bas (${fmtMAD(s.adr)}). Revoyez vos tarifs de base ou vos politiques de remise sur les longs séjours.`,
         warning: true,
       });
     }
-    if (
-      s.cancelledReservations > 0 &&
-      s.totalReservations > 0 &&
-      s.cancelledReservations / s.totalReservations > 0.2
-    ) {
+    // Cancellation alert: only when there is at least one reservation as denominator.
+    // Shows the raw counts alongside the rate for transparency.
+    if (hasReservationData && s.cancelledReservations / s.totalReservations > 0.2) {
       alerts.push({
         key: 'cancel_rate',
-        text: `Taux d'annulation élevé (${((s.cancelledReservations / s.totalReservations) * 100).toFixed(0)} %). Vérifiez vos conditions d'annulation et la qualité des fiches.`,
+        text: `Taux d'annulation élevé (${((s.cancelledReservations / s.totalReservations) * 100).toFixed(0)} %). ${s.cancelledReservations} annulation${s.cancelledReservations > 1 ? 's' : ''} sur ${s.totalReservations} réservation${s.totalReservations > 1 ? 's' : ''}.`,
         warning: true,
       });
     }
     if (s.totalConciergeRevenue > 0) {
       alerts.push({
         key: 'concierge_active',
-        text: `Conciergerie active : ${formatMAD(s.totalConciergeRevenue)} générés sur la période.`,
+        text: `Conciergerie active : ${fmtMAD(s.totalConciergeRevenue)} générés sur la période.`,
         warning: false,
       });
     }
   }
 
-  const topProperties = (report?.properties ?? [])
-    .slice()
-    .sort((a, b) => b.revenue - a.revenue)
-    .slice(0, 5);
+  // getPortfolioReport already returns properties sorted by revenue desc (reports.ts:256).
+  const topProperties = (report?.properties ?? []).slice(0, 5);
 
   return (
     <>
@@ -148,8 +174,8 @@ function IntelligenceContent({ range }: Props) {
       {/* ── KPI Cards ── */}
       <View style={styles.kpiGrid}>
         {KPIS.map((kpi) => {
-          const value = kpiValue(kpi.key);
-          const formatted = isLoading ? '—' : kpiFormatted(kpi.key, value);
+          const display = isLoading ? '—' : kpiDisplay(kpi.key);
+          const insufficient = !isLoading && kpiInsufficient(kpi.key);
           const isOpen = openTooltip === kpi.key;
           return (
             <View key={kpi.key} style={styles.kpiCard}>
@@ -163,7 +189,9 @@ function IntelligenceContent({ range }: Props) {
                   <Text style={styles.infoIcon}>ⓘ</Text>
                 </Pressable>
               </View>
-              <Text style={styles.kpiValue}>{formatted}</Text>
+              <Text style={[styles.kpiValue, insufficient && styles.kpiValueInsufficient]}>
+                {display}
+              </Text>
               {isOpen && (
                 <View style={styles.tooltipBox}>
                   <Text style={styles.tooltipName}>{kpi.name}</Text>
@@ -198,9 +226,9 @@ function IntelligenceContent({ range }: Props) {
 
       <View style={styles.biCard}>
         <Text style={styles.biSection}>Hébergement</Text>
-        <BiRow label="Revenus nets" value={isLoading ? '—' : formatMAD(s?.totalNetRevenue ?? 0)} />
-        <BiRow label="ADR" value={isLoading ? '—' : `${formatMAD(s?.adr ?? 0)} / nuit`} />
-        <BiRow label="Durée moyenne de séjour" value={isLoading ? '—' : `${(s?.avgStay ?? 0).toFixed(1)} nuits`} />
+        <BiRow label="Revenus nets" value={isLoading ? '—' : fmtMAD(s?.totalNetRevenue ?? 0)} />
+        <BiRow label="ADR" value={isLoading ? '—' : (hasNightsData ? `${fmtMAD(s?.adr ?? 0)} / nuit` : 'Données insuffisantes')} />
+        <BiRow label="Durée moyenne de séjour" value={isLoading ? '—' : (hasReservationData ? `${(s?.avgStay ?? 0).toFixed(1)} nuits` : 'Données insuffisantes')} />
         <BiRow label="Nuits facturées" value={isLoading ? '—' : `${s?.totalNights ?? 0}`} />
         <BiRow label="Réservations" value={isLoading ? '—' : `${s?.totalReservations ?? 0}`} />
         <BiRow label="Annulations" value={isLoading ? '—' : `${s?.cancelledReservations ?? 0}`} last />
@@ -208,13 +236,13 @@ function IntelligenceContent({ range }: Props) {
 
       <View style={styles.biCard}>
         <Text style={styles.biSection}>Conciergerie</Text>
-        <BiRow label="Revenus conciergerie" value={isLoading ? '—' : formatMAD(s?.totalConciergeRevenue ?? 0)} last />
+        <BiRow label="Revenus conciergerie" value={isLoading ? '—' : fmtMAD(s?.totalConciergeRevenue ?? 0)} last />
       </View>
 
       <View style={styles.biCard}>
         <Text style={styles.biSection}>Total</Text>
-        <BiRow label="Profit AMKOUY" value={isLoading ? '—' : formatMAD(s?.totalProfit ?? 0)} highlight />
-        <BiRow label="Taux d'occupation" value={isLoading ? '—' : `${(s?.occupancyRate ?? 0).toFixed(1)} %`} />
+        <BiRow label="Profit AMKOUY" value={isLoading ? '—' : fmtMAD(s?.totalProfit ?? 0)} highlight />
+        <BiRow label="Taux d'occupation" value={isLoading ? '—' : (hasReservationData ? `${(s?.occupancyRate ?? 0).toFixed(1)} %` : 'Données insuffisantes')} />
         <BiRow label="Biens actifs" value={isLoading ? '—' : `${s?.activeProperties ?? 0}`} last />
       </View>
 
@@ -235,7 +263,7 @@ function IntelligenceContent({ range }: Props) {
                     {p.city ?? '—'} · {p.reservationsCount} rés. · Occ. {p.occupancyRate.toFixed(0)} %
                   </Text>
                 </View>
-                <Text style={styles.rankValue}>{formatMAD(p.revenue)}</Text>
+                <Text style={styles.rankValue}>{fmtMAD(p.revenue)}</Text>
               </View>
             ))}
           </View>
@@ -327,6 +355,10 @@ const styles = StyleSheet.create({
   },
   kpiValue: {
     ...robotoText(700, 16, { color: AmkouyColors.text }),
+  },
+  kpiValueInsufficient: {
+    // Visually de-emphasised — not an error, just "not enough data yet"
+    ...robotoText(400, 11, { color: AmkouyColors.textFaint, fontStyle: 'italic' }),
   },
   tooltipBox: {
     marginTop: 8,

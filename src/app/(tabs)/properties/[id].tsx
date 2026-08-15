@@ -1,4 +1,4 @@
-import { useLocalSearchParams } from 'expo-router';
+import { router, useLocalSearchParams } from 'expo-router';
 import { useEffect, useState } from 'react';
 import { ActivityIndicator, Image, Pressable, StyleSheet, Text, View } from 'react-native';
 
@@ -14,7 +14,9 @@ import { PropertyPricingForm, PropertyPricingFormValues } from '@/components/for
 import { PropertySetupForm, PropertySetupFormValues } from '@/components/forms/property-setup-form';
 import { Icon } from '@/components/icon';
 import { AmkouyColors } from '@/constants/amkouy-theme';
+import { canAccess } from '@/constants/permissions';
 import { robotoText } from '@/constants/typography';
+import { useAuth } from '@/hooks/use-auth';
 import { useDeleteProperty, useProperty, useUpdateProperty } from '@/hooks/use-properties';
 import {
   useActivateProperty,
@@ -43,6 +45,7 @@ export default function PropertyDetailScreen() {
 
 function PropertyDetailContent() {
   const { id } = useLocalSearchParams<{ id: string }>();
+  const { profile } = useAuth();
   const { data: property, isLoading, isError, refetch } = useProperty(id);
   const updateProperty = useUpdateProperty();
   const deleteProperty = useDeleteProperty();
@@ -290,6 +293,13 @@ function PropertyDetailContent() {
           )}
         </Card>
 
+        {canAccess(profile?.role, 'intelligence') && (
+          <Pressable onPress={() => router.push({ pathname: '/more/property-intelligence/[id]', params: { id: property.id } })} style={styles.intelligenceButton}>
+            <Icon name="insights" size={20} color={AmkouyColors.primaryContainer} />
+            <Text style={styles.intelligenceButtonText}>Profil Intelligence</Text>
+          </Pressable>
+        )}
+
         <Pressable onPress={handleDelete} style={styles.deleteButton}>
           <Icon name="delete_outline" size={20} color={AmkouyColors.error} />
           <Text style={styles.deleteButtonText}>Supprimer ce bien</Text>
@@ -508,6 +518,20 @@ const styles = StyleSheet.create({
   },
   deleteButtonText: {
     ...robotoText(600, 13, { color: AmkouyColors.error }),
+  },
+  intelligenceButton: {
+    marginTop: 16,
+    height: 50,
+    borderRadius: 25,
+    borderWidth: 1.5,
+    borderColor: AmkouyColors.primaryContainer,
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    gap: 8,
+  },
+  intelligenceButtonText: {
+    ...robotoText(600, 13, { color: AmkouyColors.primaryContainer }),
   },
   stickyFooter: {
     backgroundColor: '#fff',
